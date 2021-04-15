@@ -27,6 +27,8 @@ OBJS-$(HAVE_THREADS)                         += pthread.o
 OBJS-$(CONFIG_QSVVPP)                        += qsvvpp.o
 OBJS-$(CONFIG_SCENE_SAD)                     += scene_sad.o
 OBJS-$(CONFIG_DNN)                           += dnn_filter_common.o
+OBJS-$(CONFIG_DNN)                           += queue.o
+OBJS-$(CONFIG_DNN)                           += safe_queue.o
 include $(SRC_PATH)/libavfilter/dnn/Makefile
 
 # audio filters

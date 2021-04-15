@@ -26,13 +26,13 @@
 #include "libavutil/thread.h"
 
 #if HAVE_PTHREAD_CANCEL
-#define DNNCond pthread_cond_t
+#define SafeQueueCond pthread_cond_t
 #define dnn_cond_init pthread_cond_init
 #define dnn_cond_destroy pthread_cond_destroy
 #define dnn_cond_signal pthread_cond_signal
 #define dnn_cond_wait pthread_cond_wait
 #else
-#define DNNCond char
+#define SafeQueueCond char
 static inline int dnn_cond_init(DNNCond *cond, const void *attr) { return 0; }
 static inline int dnn_cond_destroy(DNNCond *cond) { return 0; }
 static inline int dnn_cond_signal(DNNCond *cond) { return 0; }
@@ -46,7 +46,7 @@ static inline int dnn_cond_wait(DNNCond *cond, AVMutex *mutex)
 struct SafeQueue {
     Queue *q;
     AVMutex mutex;
-    DNNCond cond;
+    SafeQueueCond cond;
 };
 
 SafeQueue *ff_safe_queue_create(void)
@@ -102,7 +102,7 @@ int ff_safe_queue_push_back(SafeQueue *sq, void *v)
     return ret;
 }
 
-void *ff_safe_queue_pop_front(SafeQueue *sq)
+void *ff_safe_queue_pop_front_blocking(SafeQueue *sq)
 {
     void *value;
     ff_mutex_lock(&sq->mutex);

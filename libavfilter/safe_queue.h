@@ -18,8 +18,8 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
-#ifndef AVFILTER_DNN_SAFE_QUEUE_H
-#define AVFILTER_DNN_SAFE_QUEUE_H
+#ifndef AVFILTER_SAFE_QUEUE_H
+#define AVFILTER_SAFE_QUEUE_H
 
 /**
  * Double-ended queue with mutex locks ensuring
@@ -91,6 +91,6 @@ int ff_safe_queue_push_back(SafeQueue *sq, void *v);
  * If a null pointer or empty queue is passed,
  * it returns NULL
  */
-void *ff_safe_queue_pop_front(SafeQueue *sq);
+void *ff_safe_queue_pop_front_blocking(SafeQueue *sq);
 
 #endif

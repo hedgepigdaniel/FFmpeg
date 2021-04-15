@@ -19,8 +19,8 @@
  */
 
 
-#ifndef AVFILTER_DNN_QUEUE_H
-#define AVFILTER_DNN_QUEUE_H
+#ifndef AVFILTER_QUEUE_H
+#define AVFILTER_QUEUE_H
 
 /**
  * Linear double-ended data structure

@@ -30,8 +30,8 @@
 #include "libavutil/opt.h"
 #include "libavutil/avstring.h"
 #include "../internal.h"
-#include "queue.h"
-#include "safe_queue.h"
+#include "../queue.h"
+#include "../safe_queue.h"
 #include <c_api/ie_c_api.h>
 
 typedef struct OVOptions{
@@ -726,7 +726,7 @@ DNNReturnType ff_dnn_execute_model_async_ov(const DNNModel *model, const char *i
         return DNN_ERROR;
     }
 
-    request = ff_safe_queue_pop_front(ov_model->request_queue);
+    request = ff_safe_queue_pop_front_blocking(ov_model->request_queue);
     if (!request) {
         av_log(ctx, AV_LOG_ERROR, "unable to get infer request.\n");
         return DNN_ERROR;
@@ -765,7 +765,7 @@ DNNReturnType ff_dnn_flush_ov(const DNNModel *model)
     IEStatusCode status;
     DNNReturnType ret;
 
-    request = ff_safe_queue_pop_front(ov_model->request_queue);
+    request = ff_safe_queue_pop_front_blocking(ov_model->request_queue);
     if (!request) {
         av_log(ctx, AV_LOG_ERROR, "unable to get infer request.\n");
         return DNN_ERROR;
@@ -804,7 +804,7 @@ void ff_dnn_free_model_ov(DNNModel **model)
     if (*model){
         OVModel *ov_model = (*model)->model;
         while (ff_safe_queue_size(ov_model->request_queue) != 0) {
-            RequestItem *item = ff_safe_queue_pop_front(ov_model->request_queue);
+            RequestItem *item = ff_safe_queue_pop_front_blocking(ov_model->request_queue);
             if (item && item->infer_request) {
                 ie_infer_request_free(&item->infer_request);
             }
