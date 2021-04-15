@@ -239,6 +239,7 @@ OBJS-$(CONFIG_DESHAKE_OPENCL_FILTER)        += vf_deshake_opencl.o opencl.o \
 OBJS-$(CONFIG_DESHAKE_FILTER)                += vf_deshake.o transform.o
 OBJS-$(CONFIG_DESPILL_FILTER)                += vf_despill.o
 OBJS-$(CONFIG_DETELECINE_FILTER)             += vf_detelecine.o
+OBJS-$(CONFIG_DEWOBBLE_OPENCL_FILTER)        += vf_dewobble_opencl.o opencl.o
 OBJS-$(CONFIG_DILATION_FILTER)               += vf_neighbor.o
 OBJS-$(CONFIG_DILATION_OPENCL_FILTER)        += vf_neighbor_opencl.o opencl.o \
                                                 opencl/neighbor.o
