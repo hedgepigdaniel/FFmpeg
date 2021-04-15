@@ -31,44 +31,38 @@
 #include "video.h"
 #include "transpose.h"
 
+typedef enum CameraModel {
+    CAMERA_MODEL_RECTILINEAR,
+    CAMERA_MODEL_EQUIDISTANT_FISHEYE,
+    NB_CAMERA_MODELS,
+} CameraModel;
+
+typedef struct Camera {
+    CameraModel model;
+    double focal_length;
+} Camera;
+
+typedef enum StabilizationAlgorithm {
+    STABILIZATION_ALGORITHM_ORIGINAL,
+    STABILIZATION_ALGORITHM_FIXED,
+    STABILIZATION_ALGORITHM_SMOOTH,
+    NB_STABILIZATION_ALGORITHMS,
+} StabilizationAlgorithm;
+
 typedef struct DewobbleOpenCLContext {
     OpenCLFilterContext ocf;
-    int                   initialised;
-    int passthrough;    ///< PassthroughType, landscape passthrough mode enabled
-    int dir;            ///< TransposeDir
-    cl_kernel             kernel;
-    cl_command_queue      command_queue;
+    int initialised;
+    Camera input_camera;
+    Camera output_camera;
+    StabilizationAlgorithm stabilization_algorithm;
+    int stabilization_radius;
 } DewobbleOpenCLContext;
 
 static int dewobble_opencl_init(AVFilterContext *avctx)
 {
     DewobbleOpenCLContext *ctx = avctx->priv;
-    cl_int cle;
-    int err;
-
-    err = ff_opencl_filter_load_program(avctx, &ff_opencl_source_transpose, 1);
-    if (err < 0)
-        goto fail;
-
-    ctx->command_queue = clCreateCommandQueue(ctx->ocf.hwctx->context,
-                                              ctx->ocf.hwctx->device_id,
-                                              0, &cle);
-    CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to create OpenCL "
-                     "command queue %d.\n", cle);
-
-    ctx->kernel = clCreateKernel(ctx->ocf.program, "transpose", &cle);
-    CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to create kernel %d.\n", cle);
-
-
     ctx->initialised = 1;
     return 0;
-
-fail:
-    if (ctx->command_queue)
-        clReleaseCommandQueue(ctx->command_queue);
-    if (ctx->kernel)
-        clReleaseKernel(ctx->kernel);
-    return err;
 }
 
 static int dewobble_opencl_config_output(AVFilterLink *outlink)
@@ -79,23 +73,6 @@ static int dewobble_opencl_config_output(AVFilterLink *outlink)
     const AVPixFmtDescriptor *desc_in  = av_pix_fmt_desc_get(inlink->format);
     int ret;
 
-    if ((inlink->w >= inlink->h &&
-         s->passthrough == TRANSPOSE_PT_TYPE_LANDSCAPE) ||
-        (inlink->w <= inlink->h &&
-         s->passthrough == TRANSPOSE_PT_TYPE_PORTRAIT)) {
-        if (inlink->hw_frames_ctx) {
-            outlink->hw_frames_ctx = av_buffer_ref(inlink->hw_frames_ctx);
-            if (!outlink->hw_frames_ctx)
-                return AVERROR(ENOMEM);
-        }
-        av_log(avctx, AV_LOG_VERBOSE,
-               "w:%d h:%d -> w:%d h:%d (passthrough mode)\n",
-               inlink->w, inlink->h, inlink->w, inlink->h);
-
-        return 0;
-    } else {
-        s->passthrough = TRANSPOSE_PT_TYPE_NONE;
-    }
 
     if (desc_in->log2_chroma_w != desc_in->log2_chroma_h) {
         av_log(avctx, AV_LOG_ERROR, "Input format %s not supported.\n",
@@ -103,34 +80,14 @@ static int dewobble_opencl_config_output(AVFilterLink *outlink)
         return AVERROR(EINVAL);
     }
 
-    s->ocf.output_width = inlink->h;
-    s->ocf.output_height = inlink->w;
     ret = ff_opencl_filter_config_output(outlink);
     if (ret < 0)
         return ret;
 
-    if (inlink->sample_aspect_ratio.num)
-        outlink->sample_aspect_ratio = av_div_q((AVRational) { 1, 1 },
-                                                inlink->sample_aspect_ratio);
-    else
-        outlink->sample_aspect_ratio = inlink->sample_aspect_ratio;
-
-    av_log(avctx, AV_LOG_VERBOSE,
-           "w:%d h:%d dir:%d -> w:%d h:%d rotation:%s vflip:%d\n",
-           inlink->w, inlink->h, s->dir, outlink->w, outlink->h,
-           s->dir == 1 || s->dir == 3 ? "clockwise" : "counterclockwise",
-           s->dir == 0 || s->dir == 3);
+    av_log(avctx, AV_LOG_VERBOSE, "w:%d h:%d\n", inlink->w, inlink->h);
     return 0;
 }
 
-static AVFrame *get_video_buffer(AVFilterLink *inlink, int w, int h)
-{
-    DewobbleOpenCLContext *s = inlink->dst->priv;
-
-    return s->passthrough ?
-        ff_null_get_video_buffer   (inlink, w, h) :
-        ff_default_get_video_buffer(inlink, w, h);
-}
 
 static int dewobble_opencl_filter_frame(AVFilterLink *inlink, AVFrame *input)
 {
@@ -138,10 +95,7 @@ static int dewobble_opencl_filter_frame(AVFilterLink *inlink, AVFrame *input)
     AVFilterLink     *outlink = avctx->outputs[0];
     DewobbleOpenCLContext *ctx = avctx->priv;
     AVFrame *output = NULL;
-    size_t global_work[2];
-    cl_mem src, dst;
-    cl_int cle;
-    int err, p;
+    int err;
 
     av_log(ctx, AV_LOG_DEBUG, "Filter input: %s, %ux%u (%"PRId64").\n",
            av_get_pix_fmt_name(input->format),
@@ -150,8 +104,11 @@ static int dewobble_opencl_filter_frame(AVFilterLink *inlink, AVFrame *input)
     if (!input->hw_frames_ctx)
         return AVERROR(EINVAL);
 
-    if (ctx->passthrough)
-        return ff_filter_frame(outlink, input);
+    if (!ctx->initialised) {
+        err = dewobble_opencl_init(avctx);
+        if (err < 0)
+            goto fail;
+    }
 
     output = ff_get_video_buffer(outlink, outlink->w, outlink->h);
     if (!output) {
@@ -163,40 +120,6 @@ static int dewobble_opencl_filter_frame(AVFilterLink *inlink, AVFrame *input)
     if (err < 0)
         goto fail;
 
-    if (input->sample_aspect_ratio.num == 0) {
-        output->sample_aspect_ratio = input->sample_aspect_ratio;
-    } else {
-        output->sample_aspect_ratio.num = input->sample_aspect_ratio.den;
-        output->sample_aspect_ratio.den = input->sample_aspect_ratio.num;
-    }
-
-    if (!ctx->initialised) {
-        err = dewobble_opencl_init(avctx);
-        if (err < 0)
-            goto fail;
-    }
-
-    for (p = 0; p < FF_ARRAY_ELEMS(output->data); p++) {
-        src = (cl_mem) input->data[p];
-        dst = (cl_mem) output->data[p];
-
-        if (!dst)
-            break;
-        CL_SET_KERNEL_ARG(ctx->kernel, 0, cl_mem, &dst);
-        CL_SET_KERNEL_ARG(ctx->kernel, 1, cl_mem, &src);
-        CL_SET_KERNEL_ARG(ctx->kernel, 2, cl_int, &ctx->dir);
-
-        err = ff_opencl_filter_work_size_from_image(avctx, global_work, output,
-                                                    p, 16);
-
-        cle = clEnqueueNDRangeKernel(ctx->command_queue, ctx->kernel, 2, NULL,
-                                     global_work, NULL,
-                                     0, NULL, NULL);
-        CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to enqueue kernel: %d.\n", cle);
-    }
-    cle = clFinish(ctx->command_queue);
-    CL_FAIL_ON_ERROR(AVERROR(EIO), "Failed to finish command queue: %d.\n", cle);
-
     av_frame_free(&input);
 
     av_log(ctx, AV_LOG_DEBUG, "Filter output: %s, %ux%u (%"PRId64").\n",
@@ -206,48 +129,146 @@ static int dewobble_opencl_filter_frame(AVFilterLink *inlink, AVFrame *input)
     return ff_filter_frame(outlink, output);
 
 fail:
-    clFinish(ctx->command_queue);
     av_frame_free(&input);
     av_frame_free(&output);
     return err;
 }
 
-static av_cold void dewobble_opencl_uninit(AVFilterContext *avctx)
-{
-    DewobbleOpenCLContext *ctx = avctx->priv;
-    cl_int cle;
-
-    if (ctx->kernel) {
-        cle = clReleaseKernel(ctx->kernel);
-        if (cle != CL_SUCCESS)
-            av_log(avctx, AV_LOG_ERROR, "Failed to release "
-                   "kernel: %d.\n", cle);
-    }
-
-    if (ctx->command_queue) {
-        cle = clReleaseCommandQueue(ctx->command_queue);
-        if (cle != CL_SUCCESS)
-            av_log(avctx, AV_LOG_ERROR, "Failed to release "
-                   "command queue: %d.\n", cle);
-    }
-
-    ff_opencl_filter_uninit(avctx);
-}
 
 #define OFFSET(x) offsetof(DewobbleOpenCLContext, x)
+#define OFFSET_CAMERA(x) offsetof(Camera, x)
 #define FLAGS (AV_OPT_FLAG_FILTERING_PARAM | AV_OPT_FLAG_VIDEO_PARAM)
 static const AVOption dewobble_opencl_options[] = {
-    { "dir", "set transpose direction", OFFSET(dir), AV_OPT_TYPE_INT, { .i64 = TRANSPOSE_CCLOCK_FLIP }, 0, 3, FLAGS, "dir" },
-        { "cclock_flip", "rotate counter-clockwise with vertical flip", 0, AV_OPT_TYPE_CONST, { .i64 = TRANSPOSE_CCLOCK_FLIP }, .flags=FLAGS, .unit = "dir" },
-        { "clock",       "rotate clockwise",                            0, AV_OPT_TYPE_CONST, { .i64 = TRANSPOSE_CLOCK       }, .flags=FLAGS, .unit = "dir" },
-        { "cclock",      "rotate counter-clockwise",                    0, AV_OPT_TYPE_CONST, { .i64 = TRANSPOSE_CCLOCK      }, .flags=FLAGS, .unit = "dir" },
-        { "clock_flip",  "rotate clockwise with vertical flip",         0, AV_OPT_TYPE_CONST, { .i64 = TRANSPOSE_CLOCK_FLIP  }, .flags=FLAGS, .unit = "dir" },
+    // Input camera options
+    {
+        "input_model",
+        "input camera projection model",
+        OFFSET(input_camera) + OFFSET_CAMERA(model),
+        AV_OPT_TYPE_INT,
+        { .i64 = NB_CAMERA_MODELS },
+        0,
+        NB_CAMERA_MODELS - 1,
+        FLAGS,
+        "model",
+    },
+    {
+        "input_focal",
+        "input camera focal length in pixels",
+        OFFSET(input_camera) + OFFSET_CAMERA(focal_length),
+        AV_OPT_TYPE_DOUBLE,
+        { .dbl = 0 },
+        0,
+        DBL_MAX,
+        .flags=FLAGS,
+        .unit = "in_f",
+    },
 
-    { "passthrough", "do not apply transposition if the input matches the specified geometry",
-      OFFSET(passthrough), AV_OPT_TYPE_INT, {.i64=TRANSPOSE_PT_TYPE_NONE},  0, INT_MAX, FLAGS, "passthrough" },
-        { "none",      "always apply transposition",   0, AV_OPT_TYPE_CONST, {.i64=TRANSPOSE_PT_TYPE_NONE},      INT_MIN, INT_MAX, FLAGS, "passthrough" },
-        { "portrait",  "preserve portrait geometry",   0, AV_OPT_TYPE_CONST, {.i64=TRANSPOSE_PT_TYPE_PORTRAIT},  INT_MIN, INT_MAX, FLAGS, "passthrough" },
-        { "landscape", "preserve landscape geometry",  0, AV_OPT_TYPE_CONST, {.i64=TRANSPOSE_PT_TYPE_LANDSCAPE}, INT_MIN, INT_MAX, FLAGS, "passthrough" },
+    // Output camera options
+    {
+        "output_model",
+        "output camera projection model",
+        OFFSET(output_camera) + OFFSET_CAMERA(model),
+        AV_OPT_TYPE_INT,
+        { .i64 = NB_CAMERA_MODELS },
+        0,
+        NB_CAMERA_MODELS - 1,
+        FLAGS,
+        "model",
+    },
+    {
+        "output_focal",
+        "output camera focal length in pixels",
+        OFFSET(output_camera) + OFFSET_CAMERA(focal_length),
+        AV_OPT_TYPE_DOUBLE,
+        { .dbl = 0 },
+        0,
+        DBL_MAX,
+        .flags=FLAGS,
+        .unit = "out_f",
+    },
+
+    // Stabilization options
+    {
+        "stab",
+        "camera orientation stabilization algorithm",
+        OFFSET(stabilization_algorithm),
+        AV_OPT_TYPE_INT,
+        { .i64 = STABILIZATION_ALGORITHM_SMOOTH },
+        0,
+        NB_STABILIZATION_ALGORITHMS - 1,
+        FLAGS,
+        "stab",
+    },
+    {
+        "stab_radius",
+        "for Savitzky-Golay smoothing: the number of frames to look ahead and behind",
+        OFFSET(stabilization_radius),
+        AV_OPT_TYPE_INT,
+        { .i64 = 15 },
+        1,
+        INT_MAX,
+        FLAGS,
+        "radius",
+    },
+
+    // Camera models
+    {
+        "rectilinear",
+        "rectilinear projection",
+        0,
+        AV_OPT_TYPE_CONST,
+        { .i64 = CAMERA_MODEL_RECTILINEAR },
+        INT_MIN,
+        INT_MAX,
+        FLAGS,
+        "model"
+    },
+    {
+        "fisheye",
+        "equidistant fisheye projection",
+        0,
+        AV_OPT_TYPE_CONST,
+        { .i64 = CAMERA_MODEL_EQUIDISTANT_FISHEYE },
+        INT_MIN,
+        INT_MAX,
+        FLAGS,
+        "model"
+    },
+
+    // Stabilization algorithms
+    {
+        "fixed",
+        "fix the camera orientation after the first frame",
+        0,
+        AV_OPT_TYPE_CONST,
+        { .i64 = STABILIZATION_ALGORITHM_FIXED },
+        INT_MIN,
+        INT_MAX,
+        FLAGS,
+        "stab"
+    },
+    {
+        "original",
+        "maintain the camera orientation from the input (do not apply stabilization)",
+        0,
+        AV_OPT_TYPE_CONST,
+        { .i64 = STABILIZATION_ALGORITHM_ORIGINAL },
+        INT_MIN,
+        INT_MAX,
+        FLAGS,
+        "stab"
+    },
+    {
+        "smooth",
+        "smooth the camera orientation using a Savitzky-Golay filter",
+        0,
+        AV_OPT_TYPE_CONST,
+        { .i64 = STABILIZATION_ALGORITHM_FIXED },
+        INT_MIN,
+        INT_MAX,
+        FLAGS,
+        "stab"
+    },
 
     { NULL }
 };
@@ -258,7 +279,6 @@ static const AVFilterPad dewobble_opencl_inputs[] = {
     {
         .name         = "default",
         .type         = AVMEDIA_TYPE_VIDEO,
-        .get_video_buffer = get_video_buffer,
         .filter_frame = &dewobble_opencl_filter_frame,
         .config_props = &ff_opencl_filter_config_input,
     },
@@ -276,11 +296,13 @@ static const AVFilterPad dewobble_opencl_outputs[] = {
 
 AVFilter ff_vf_dewobble_opencl = {
     .name           = "dewobble_opencl",
-    .description    = NULL_IF_CONFIG_SMALL("Transpose input video"),
+    .description    = NULL_IF_CONFIG_SMALL(
+        "apply motion stabilization with awareness of camera projection and/or change camera projection"
+    ),
     .priv_size      = sizeof(DewobbleOpenCLContext),
     .priv_class     = &dewobble_opencl_class,
     .init           = &ff_opencl_filter_init,
-    .uninit         = &dewobble_opencl_uninit,
+    .uninit         = &ff_opencl_filter_uninit,
     .query_formats  = &ff_opencl_filter_query_formats,
     .inputs         = dewobble_opencl_inputs,
     .outputs        = dewobble_opencl_outputs,
