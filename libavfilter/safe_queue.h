@@ -93,4 +93,6 @@ int ff_safe_queue_push_back(SafeQueue *sq, void *v);
  */
 void *ff_safe_queue_pop_front_blocking(SafeQueue *sq);
 
+void *ff_safe_queue_pop_front(SafeQueue *sq);
+
 #endif
