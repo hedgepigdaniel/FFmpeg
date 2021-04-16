@@ -54,6 +54,7 @@ typedef enum StabilizationAlgorithm {
 
 typedef struct DewobbleOpenCLContext {
     OpenCLFilterContext ocf;
+    cl_command_queue command_queue;
 
     // Options
     Camera input_camera;
@@ -114,6 +115,7 @@ static int dewobble_opencl_init(AVFilterContext *avctx) {
 }
 
 static void dewobble_opencl_uninit(AVFilterContext *avctx) {
+    cl_int cle;
     DewobbleOpenCLContext *ctx = avctx->priv;
     if (ctx->dewobble_thread_created)
     {
@@ -122,12 +124,27 @@ static void dewobble_opencl_uninit(AVFilterContext *avctx) {
     }
     ff_safe_queue_destroy(ctx->input_frame_queue);
     ff_safe_queue_destroy(ctx->output_frame_queue);
+    if (ctx->command_queue) {
+        cle = clReleaseCommandQueue(ctx->command_queue);
+        if (cle != CL_SUCCESS) {
+            av_log(avctx, AV_LOG_ERROR, "Failed to release command queue: %d.\n", cle);
+        }
+    }
     ff_opencl_filter_uninit(avctx);
 }
 
 static int dewobble_opencl_frames_init(AVFilterContext *avctx)
 {
     DewobbleOpenCLContext *ctx = avctx->priv;
+    cl_int cle;
+
+    ctx->command_queue = clCreateCommandQueue(ctx->ocf.hwctx->context,
+                                              ctx->ocf.hwctx->device_id,
+                                              0, &cle);
+    if (cle) {
+        av_log(avctx, AV_LOG_ERROR, "Failed to create OpenCL command queue %d.\n", cle);
+        return AVERROR(EIO);
+    }
 
     pthread_create(&ctx->dewobble_thread, NULL, dewobble_thread, avctx);
     ctx->dewobble_thread_created = 1;
@@ -178,10 +195,110 @@ static void queued_frame_free(QueuedFrame **frame) {
     *frame = NULL;
 }
 
+static cl_int cl_buffer_from_opencl_frame(
+    AVFilterContext *avctx,
+    cl_context context,
+    cl_command_queue command_queue,
+    AVFrame *frame,
+    cl_mem *dst_buffer
+) {
+    cl_mem luma = (cl_mem) frame->data[0];
+    cl_mem chroma = (cl_mem) frame->data[1];
+    cl_int ret = 0;
+    cl_image_format luma_fmt = { 0, 0 };
+    cl_image_format chroma_fmt = { 0, 0 };
+    size_t luma_w = 0;
+    size_t luma_h = 0;
+    size_t chroma_w = 0;
+    size_t chroma_h = 0;
+    size_t src_origin[3] = { 0, 0, 0 };
+    size_t luma_region[3] = { 0, 0, 1 };
+    size_t chroma_region[3] = { 0, 0, 1 };
+
+    ret = clGetImageInfo(luma, CL_IMAGE_FORMAT, sizeof(cl_image_format), &luma_fmt, 0);
+    if (ret) {
+        av_log(avctx, AV_LOG_ERROR, "Failed to get luma image format: %d\n", ret);
+        return ret;
+    }
+    ret = clGetImageInfo(chroma, CL_IMAGE_FORMAT, sizeof(cl_image_format), &chroma_fmt, 0);
+    if (ret) {
+        av_log(avctx, AV_LOG_ERROR, "Failed to get chroma image format: %d\n", ret);
+        return ret;
+    }
+    if (luma_fmt.image_channel_data_type != CL_UNORM_INT8 ||
+        chroma_fmt.image_channel_data_type != CL_UNORM_INT8) {
+        av_log(avctx, AV_LOG_ERROR, "Incorrect channel type\n");
+        return 1;
+    }
+    if (luma_fmt.image_channel_order != CL_R ||
+        chroma_fmt.image_channel_order != CL_RG) {
+        av_log(avctx, AV_LOG_ERROR, "Incorrect channel order\n");
+        return 1;
+    }
+
+    ret |= clGetImageInfo(luma, CL_IMAGE_WIDTH, sizeof(size_t), &luma_w, 0);
+    ret |= clGetImageInfo(luma, CL_IMAGE_HEIGHT, sizeof(size_t), &luma_h, 0);
+    ret |= clGetImageInfo(chroma, CL_IMAGE_WIDTH, sizeof(size_t), &chroma_w, 0);
+    ret |= clGetImageInfo(chroma, CL_IMAGE_HEIGHT, sizeof(size_t), &chroma_h, 0);
+    if (ret) {
+        av_log(avctx, AV_LOG_ERROR, "Failed to get image dimensions: %d\n", ret);
+        return ret;
+    }
+
+    if (luma_w != 2 * chroma_w || luma_h != 2 *chroma_h ) {
+        av_log(avctx, AV_LOG_ERROR, "Incorrect dimensions\n");
+        return 1;
+    }
+
+    *dst_buffer = clCreateBuffer(context, CL_MEM_READ_ONLY, (luma_h + chroma_h) * luma_w, NULL, &ret);
+    if (ret) {
+        av_log(avctx, AV_LOG_ERROR, "Failed to create buffer: %d\n", ret);
+        return ret;
+    }
+
+    luma_region[0] = luma_w;
+    luma_region[1] = luma_h;
+    chroma_region[0] = chroma_w;
+    chroma_region[1] = chroma_h;
+
+    ret = clEnqueueCopyImageToBuffer(
+        command_queue,
+        luma,
+        *dst_buffer,
+        src_origin,
+        luma_region,
+        0,
+        0,
+        NULL,
+        NULL
+    );
+    ret |= clEnqueueCopyImageToBuffer(
+        command_queue,
+        chroma,
+        *dst_buffer,
+        src_origin,
+        chroma_region,
+        luma_w * luma_h * 1,
+        0,
+        NULL,
+        NULL
+    );
+    ret |= clFinish(command_queue);
+    if (ret) {
+        av_log(avctx, AV_LOG_ERROR, "Failed to copy images to buffer: %d\n", ret);
+        clReleaseMemObject(*dst_buffer);
+        *dst_buffer = NULL;
+        return ret;
+    }
+
+    return ret;
+}
+
 static int consume_input_frame(AVFilterContext *avctx, AVFrame *frame) {
     DewobbleOpenCLContext *ctx = avctx->priv;
     AVFilterLink *outlink = avctx->outputs[0];
     QueuedFrame *queued_frame = NULL;
+    cl_mem frame_buffer = NULL;
     int ret = 0;
 
     if (!frame->hw_frames_ctx)
@@ -190,8 +307,21 @@ static int consume_input_frame(AVFilterContext *avctx, AVFrame *frame) {
     if (!ctx->initialized) {
         av_log(avctx, AV_LOG_VERBOSE, "Initializing\n");
         ret = dewobble_opencl_frames_init(avctx);
-        if (ret < 0)
+        if (ret < 0) {
             return ret;
+        }
+    }
+
+    ret = cl_buffer_from_opencl_frame(
+        avctx,
+        ctx->ocf.hwctx->context,
+        ctx->command_queue,
+        frame,
+        &frame_buffer
+    );
+    if (ret) {
+        av_log(avctx, AV_LOG_ERROR, "Failed to map OpenCL frame to OpenCL buffer: %d\n", ret);
+        return AVERROR(EINVAL);
     }
 
     queued_frame = queued_frame_create(
