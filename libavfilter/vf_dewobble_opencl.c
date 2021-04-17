@@ -90,10 +90,12 @@ static void *dewobble_thread(void *arg) {
     while (1) {
         queued_frame = ff_safe_queue_pop_front_blocking(ctx->input_frame_queue);
 
+        int is_eof = queued_frame->err == AVERROR_EOF;
+
         ff_safe_queue_push_back(ctx->output_frame_queue, queued_frame);
         av_log(avctx, AV_LOG_VERBOSE, "Worker thread: pushed frame.\n");
 
-        if (queued_frame->err == AVERROR_EOF) {
+        if (is_eof) {
             break;
         }
     }
@@ -535,7 +537,7 @@ static const AVOption dewobble_opencl_options[] = {
         "for Savitzky-Golay smoothing: the number of frames to look ahead and behind",
         OFFSET(stabilization_radius),
         AV_OPT_TYPE_INT,
-        { .i64 = 15 },
+        { .i64 = 120 },
         1,
         INT_MAX,
         FLAGS,
