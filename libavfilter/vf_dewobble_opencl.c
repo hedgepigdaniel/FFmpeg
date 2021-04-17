@@ -75,8 +75,8 @@ typedef struct DewobbleOpenCLContext {
 typedef struct QueuedFrame {
     int err;
     int64_t pts;
-    AVFrame *input;
-    AVFrame *output;
+    AVFrame *frame;
+    cl_mem buffer;
 } QueuedFrame;
 
 #define EXTRA_IN_PROGRESS_FRAMES 2
@@ -153,49 +153,47 @@ static int dewobble_opencl_frames_init(AVFilterContext *avctx)
     return 0;
 }
 
-static int dewobble_opencl_config_output(AVFilterLink *outlink)
-{
-    AVFilterContext *avctx = outlink->src;
-    AVFilterLink *inlink = avctx->inputs[0];
-    const AVPixFmtDescriptor *desc_in  = av_pix_fmt_desc_get(inlink->format);
+static int dewobble_opencl_config_input(AVFilterLink *inlink) {
+    AVFilterContext   *avctx = inlink->dst;
+    DewobbleOpenCLContext *ctx = avctx->priv;
     int ret;
 
 
-    if (desc_in->log2_chroma_w != desc_in->log2_chroma_h) {
-        av_log(avctx, AV_LOG_ERROR, "Input format %s not supported.\n",
-               desc_in->name);
-        return AVERROR(EINVAL);
+    ret = ff_opencl_filter_config_input(inlink);
+    if (ret < 0) {
+        return ret;
     }
 
-    ret = ff_opencl_filter_config_output(outlink);
-    if (ret < 0)
-        return ret;
+    if (ctx->ocf.output_format != AV_PIX_FMT_NV12) {
+        av_log(avctx, AV_LOG_ERROR, "Only NV12 input is supported!\n");
+        return AVERROR(ENOSYS);
+    }
 
-    av_log(avctx, AV_LOG_VERBOSE, "w:%d h:%d\n", inlink->w, inlink->h);
+    // TODO: change output width/height
     return 0;
 }
 
-static QueuedFrame *queued_frame_create(int err, int64_t pts, AVFrame *input, AVFrame *output) {
+static QueuedFrame *queued_frame_create(int err, int64_t pts, AVFrame *frame, cl_mem buffer) {
     QueuedFrame *result = av_mallocz(sizeof(QueuedFrame));
     if (result == NULL) {
         return NULL;
     }
     result->err = err;
     result->pts = pts;
-    result->input = input;
-    result->output = output;
+    result->frame = frame;
+    result->buffer = buffer;
     return result;
 }
 
 static void queued_frame_free(QueuedFrame **frame) {
     if (*frame != NULL) {
-        av_frame_free(&(*frame)->input);
-        av_frame_free(&(*frame)->output);
+        av_frame_free(&(*frame)->frame);
+        clReleaseMemObject((*frame)->buffer);
     }
-    *frame = NULL;
+    av_freep(frame);
 }
 
-static cl_int cl_buffer_from_opencl_frame(
+static cl_int copy_frame_to_buffer(
     AVFilterContext *avctx,
     cl_context context,
     cl_command_queue command_queue,
@@ -205,61 +203,15 @@ static cl_int cl_buffer_from_opencl_frame(
     cl_mem luma = (cl_mem) frame->data[0];
     cl_mem chroma = (cl_mem) frame->data[1];
     cl_int ret = 0;
-    cl_image_format luma_fmt = { 0, 0 };
-    cl_image_format chroma_fmt = { 0, 0 };
-    size_t luma_w = 0;
-    size_t luma_h = 0;
-    size_t chroma_w = 0;
-    size_t chroma_h = 0;
     size_t src_origin[3] = { 0, 0, 0 };
-    size_t luma_region[3] = { 0, 0, 1 };
-    size_t chroma_region[3] = { 0, 0, 1 };
+    size_t luma_region[3] = { frame->width, frame->height, 1 };
+    size_t chroma_region[3] = { frame->width / 2, frame->height / 2, 1 };
 
-    ret = clGetImageInfo(luma, CL_IMAGE_FORMAT, sizeof(cl_image_format), &luma_fmt, 0);
-    if (ret) {
-        av_log(avctx, AV_LOG_ERROR, "Failed to get luma image format: %d\n", ret);
-        return ret;
-    }
-    ret = clGetImageInfo(chroma, CL_IMAGE_FORMAT, sizeof(cl_image_format), &chroma_fmt, 0);
-    if (ret) {
-        av_log(avctx, AV_LOG_ERROR, "Failed to get chroma image format: %d\n", ret);
-        return ret;
-    }
-    if (luma_fmt.image_channel_data_type != CL_UNORM_INT8 ||
-        chroma_fmt.image_channel_data_type != CL_UNORM_INT8) {
-        av_log(avctx, AV_LOG_ERROR, "Incorrect channel type\n");
-        return 1;
-    }
-    if (luma_fmt.image_channel_order != CL_R ||
-        chroma_fmt.image_channel_order != CL_RG) {
-        av_log(avctx, AV_LOG_ERROR, "Incorrect channel order\n");
-        return 1;
-    }
-
-    ret |= clGetImageInfo(luma, CL_IMAGE_WIDTH, sizeof(size_t), &luma_w, 0);
-    ret |= clGetImageInfo(luma, CL_IMAGE_HEIGHT, sizeof(size_t), &luma_h, 0);
-    ret |= clGetImageInfo(chroma, CL_IMAGE_WIDTH, sizeof(size_t), &chroma_w, 0);
-    ret |= clGetImageInfo(chroma, CL_IMAGE_HEIGHT, sizeof(size_t), &chroma_h, 0);
-    if (ret) {
-        av_log(avctx, AV_LOG_ERROR, "Failed to get image dimensions: %d\n", ret);
-        return ret;
-    }
-
-    if (luma_w != 2 * chroma_w || luma_h != 2 *chroma_h ) {
-        av_log(avctx, AV_LOG_ERROR, "Incorrect dimensions\n");
-        return 1;
-    }
-
-    *dst_buffer = clCreateBuffer(context, CL_MEM_READ_ONLY, (luma_h + chroma_h) * luma_w, NULL, &ret);
+    *dst_buffer = clCreateBuffer(context, CL_MEM_READ_ONLY, frame->width * frame->height * 3 / 2, NULL, &ret);
     if (ret) {
         av_log(avctx, AV_LOG_ERROR, "Failed to create buffer: %d\n", ret);
         return ret;
     }
-
-    luma_region[0] = luma_w;
-    luma_region[1] = luma_h;
-    chroma_region[0] = chroma_w;
-    chroma_region[1] = chroma_h;
 
     ret = clEnqueueCopyImageToBuffer(
         command_queue,
@@ -278,7 +230,7 @@ static cl_int cl_buffer_from_opencl_frame(
         *dst_buffer,
         src_origin,
         chroma_region,
-        luma_w * luma_h * 1,
+        frame->width * frame->height * 1,
         0,
         NULL,
         NULL
@@ -294,9 +246,52 @@ static cl_int cl_buffer_from_opencl_frame(
     return ret;
 }
 
+static int copy_buffer_to_frame(
+    AVFilterContext *avctx,
+    cl_mem src_buffer,
+    AVFrame *frame
+) {
+    DewobbleOpenCLContext *ctx = avctx->priv;
+    cl_mem luma = (cl_mem) frame->data[0];
+    cl_mem chroma = (cl_mem) frame->data[1];
+    cl_int ret = 0;
+    size_t dst_origin[3] = { 0, 0, 0 };
+    size_t luma_region[3] = { frame->width, frame->height, 1 };
+    size_t chroma_region[3] = { frame->width / 2, frame->height / 2, 1 };
+
+    ret = clEnqueueCopyBufferToImage(
+        ctx->command_queue,
+        src_buffer,
+        luma,
+        0,
+        dst_origin,
+        luma_region,
+        0,
+        NULL,
+        NULL
+    );
+    ret |= clEnqueueCopyBufferToImage(
+        ctx->command_queue,
+        src_buffer,
+        chroma,
+        frame->width * frame->height * 1,
+        dst_origin,
+        chroma_region,
+        0,
+        NULL,
+        NULL
+    );
+    ret |= clFinish(ctx->command_queue);
+    if (ret) {
+        av_log(avctx, AV_LOG_ERROR, "Failed to copy buffer to images: %d\n", ret);
+        return ret;
+    }
+
+    return ret;
+}
+
 static int consume_input_frame(AVFilterContext *avctx, AVFrame *frame) {
     DewobbleOpenCLContext *ctx = avctx->priv;
-    AVFilterLink *outlink = avctx->outputs[0];
     QueuedFrame *queued_frame = NULL;
     cl_mem frame_buffer = NULL;
     int ret = 0;
@@ -312,7 +307,7 @@ static int consume_input_frame(AVFilterContext *avctx, AVFrame *frame) {
         }
     }
 
-    ret = cl_buffer_from_opencl_frame(
+    ret = copy_frame_to_buffer(
         avctx,
         ctx->ocf.hwctx->context,
         ctx->command_queue,
@@ -328,18 +323,10 @@ static int consume_input_frame(AVFilterContext *avctx, AVFrame *frame) {
         0,
         frame->pts,
         frame,
-        ff_get_video_buffer(outlink, outlink->w, outlink->h)
+        frame_buffer
     );
     if (queued_frame == NULL) {
         return AVERROR(ENOMEM);
-    } else if (queued_frame->output == NULL) {
-        queued_frame_free(&queued_frame);
-        return AVERROR(ENOMEM);
-    }
-
-    ret = av_frame_copy_props(queued_frame->output, frame);
-    if (ret < 0) {
-        return ret;
     }
 
     ret = ff_safe_queue_push_back(ctx->input_frame_queue, queued_frame);
@@ -347,7 +334,6 @@ static int consume_input_frame(AVFilterContext *avctx, AVFrame *frame) {
     {
         return ret;
     }
-    ctx->nb_frames_in_progress += 1;
     return 0;
 }
 
@@ -368,6 +354,27 @@ static int handle_input_eof(DewobbleOpenCLContext *ctx, int64_t pts) {
     ret = ff_safe_queue_push_back(ctx->input_frame_queue, queued_frame);
     if (ret < 0)
     {
+        return ret;
+    }
+    return 0;
+}
+
+static int send_output_frame(AVFilterContext *avctx, AVFilterLink *outlink, QueuedFrame *queued_frame) {
+    int ret;
+    AVFrame *frame = ff_get_video_buffer(outlink, outlink->w, outlink->h);
+
+    // Copy frame props
+    av_frame_copy_props(frame, queued_frame->frame);
+
+    // copy frame contents from OpenCL buffer to AVFrame
+    ret = copy_buffer_to_frame(avctx, queued_frame->buffer, frame);
+    if (ret) {
+        return ret;
+    }
+
+    // Send the frame
+    ret = ff_filter_frame(outlink, frame);
+    if (ret) {
         return ret;
     }
     return 0;
@@ -404,9 +411,10 @@ static int activate(AVFilterContext *avctx)
                 ctx->nb_frames_in_progress - 1
             );
             ctx->nb_frames_in_progress -= 1;
-            ret = ff_filter_frame(outlink, queued_output_frame->output);
-            if (ret == 0) {
-                queued_output_frame->output = NULL;
+            ret = send_output_frame(avctx, outlink, queued_output_frame);
+            if (ret) {
+                queued_frame_free(&queued_output_frame);
+                return ret;
             }
         }
         queued_frame_free(&queued_output_frame);
@@ -426,6 +434,7 @@ static int activate(AVFilterContext *avctx)
         } else if (ret > 0) {
             av_log(avctx, AV_LOG_VERBOSE, "Consuming input frame %d -> %d\n", ctx->nb_frames_in_progress, ctx->nb_frames_in_progress + 1);
             ret = consume_input_frame(avctx, frame);
+            ctx->nb_frames_in_progress += 1;
             if (ret) {
                 av_frame_free(&frame);
                 return ret;
@@ -601,7 +610,7 @@ static const AVFilterPad dewobble_opencl_inputs[] = {
     {
         .name         = "default",
         .type         = AVMEDIA_TYPE_VIDEO,
-        .config_props = &ff_opencl_filter_config_input,
+        .config_props = &dewobble_opencl_config_input,
     },
     { NULL }
 };
@@ -610,7 +619,7 @@ static const AVFilterPad dewobble_opencl_outputs[] = {
     {
         .name         = "default",
         .type         = AVMEDIA_TYPE_VIDEO,
-        .config_props = &dewobble_opencl_config_output,
+        .config_props = &ff_opencl_filter_config_output,
     },
     { NULL }
 };
