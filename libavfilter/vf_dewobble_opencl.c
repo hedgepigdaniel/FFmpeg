@@ -85,12 +85,13 @@ static void *dewobble_thread(void *arg) {
     AVFilterContext *avctx = arg;
     DewobbleOpenCLContext *ctx = avctx->priv;
     QueuedFrame *queued_frame = NULL;
+    int is_eof;
 
     av_log(avctx, AV_LOG_VERBOSE, "Started worker thread\n");
     while (1) {
         queued_frame = ff_safe_queue_pop_front_blocking(ctx->input_frame_queue);
 
-        int is_eof = queued_frame->err == AVERROR_EOF;
+        is_eof = queued_frame->err == AVERROR_EOF;
 
         ff_safe_queue_push_back(ctx->output_frame_queue, queued_frame);
         av_log(avctx, AV_LOG_VERBOSE, "Worker thread: pushed frame.\n");
@@ -348,7 +349,6 @@ static int handle_input_eof(DewobbleOpenCLContext *ctx, int64_t pts) {
     QueuedFrame *queued_frame = NULL;
     int ret;
 
-    ctx->input_eof = 1;
     queued_frame = queued_frame_create(AVERROR_EOF, pts, NULL, NULL);
     if (queued_frame == NULL) {
         return AVERROR(ENOMEM);
@@ -456,6 +456,7 @@ static int activate(AVFilterContext *avctx)
     if (!ctx->input_eof && ff_inlink_acknowledge_status(inlink, &status, &pts)) {
         if (status == AVERROR_EOF) {
             av_log(avctx, AV_LOG_VERBOSE, "Reached end of input\n");
+            ctx->input_eof = 1;
             ret = handle_input_eof(ctx, pts);
             if (ret) {
                 return ret;
