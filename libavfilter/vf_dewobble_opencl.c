@@ -17,6 +17,7 @@
  */
 #include <float.h>
 #include <pthread.h>
+#include <signal.h>
 
 #include "libavutil/avassert.h"
 #include "libavutil/common.h"
@@ -108,16 +109,18 @@ typedef struct DewobbleOpenCLContext {
     // Number of frame jobs currently in progress (read from inlink but
     // not yet sent to outlink)
     int nb_frames_in_progress;
-    int nb_frames_consumed;
+
+    // Number of frames consumed so far
+    long nb_frames_consumed;
 
     // Whether the stabilization thread has been created
     int dewobble_thread_created;
 
+    // Whether the stabilization thread has been cancelled
+    int dewobble_thread_ending;
+
     // Thread where the stabilization transform is done
     pthread_t dewobble_thread;
-
-    // All frames currently in progress
-    Queue *frame_queue;
 
     // frame jobs with the input copied to a buffer, ready for stabilization
     SafeQueue *dewobble_queue;
@@ -127,35 +130,13 @@ typedef struct DewobbleOpenCLContext {
 
 } DewobbleOpenCLContext;
 
-// Stages for the filtering of a frame
-typedef enum FrameJobStage {
-
-    // Input frame OpenCL images to be copied to an OpenCL buffer
-    FRAME_JOB_STAGE_READING_INPUT,
-
-    // Input frame OpenCL buffer to have dewobbling applied
-    FRAME_JOB_STAGE_DEWOBBLING,
-
-    //  Output OpenCL buffer to be copied to output frame OpenCL images
-    FRAME_JOB_STAGE_WRITING_OUTPUT,
-
-    // Work complete, output frame ready to be sent to output link
-    FRAME_JOB_STAGE_DONE
-
-} FrameJobStage;
-
 // The state of work associated with a particular frame
 typedef struct FrameJob {
-    int num;
+    // Serial number for this frame
+    long num;
 
     // The AVFilterContext for the filter
     AVFilterContext *avctx;
-
-    // The current stage of processing
-    FrameJobStage stage;
-
-    // The error associated with a particular frame (or EOF after the last frame)
-    int err;
 
     // Frame presentation timestamp
     int64_t pts;
@@ -163,27 +144,18 @@ typedef struct FrameJob {
     // Input frame
     AVFrame *input_frame;
 
-    // Output frame
-    AVFrame *output_frame;
-
     // Input frame as OpenCL buffer
     cl_mem input_buffer;
 
     // Output frame as OpenCL buffer
     cl_mem output_buffer;
 
-    // Mutex protecting access to `stage` and `copy_events_remaining`
-    AVMutex mutex;
-
-    // For stages involving copying between OpenCL images and a buffer, the number
-    // of OpenCL events remaining before the next stage can be started
-    int copy_events_remaining;
-
 } FrameJob;
 
 typedef enum DewobbleMessageType {
     DEWOBBLE_MESSAGE_TYPE_JOB,
-    DEWOBBLE_MESSAGE_TYPE_EOF
+    DEWOBBLE_MESSAGE_TYPE_STOP,
+    DEWOBBLE_MESSAGE_TYPE_ERROR
 } DewobbleMessageType;
 
 typedef struct DewobbleMessage {
@@ -192,20 +164,6 @@ typedef struct DewobbleMessage {
 } DewobbleMessage;
 
 #define EXTRA_IN_PROGRESS_FRAMES 2
-
-static FrameJobStage queued_frame_get_stage(FrameJob *job) {
-    FrameJobStage stage;
-    ff_mutex_lock(&job->mutex);
-    stage = job->stage;
-    ff_mutex_unlock(&job->mutex);
-    return stage;
-};
-
-static void frame_job_set_stage(FrameJob *job, FrameJobStage stage) {
-    ff_mutex_lock(&job->mutex);
-    job->stage = stage;
-    ff_mutex_unlock(&job->mutex);
-};
 
 static DewobbleMessage *dewobble_message_create(DewobbleMessageType type, FrameJob *job) {
     DewobbleMessage *result = av_mallocz(sizeof(DewobbleMessage));
@@ -217,43 +175,142 @@ static DewobbleMessage *dewobble_message_create(DewobbleMessageType type, FrameJ
     return result;
 }
 
+static void dewobble_message_free(DewobbleMessage **message) {
+    if (*message != NULL) {
+        free(*message);
+        *message = NULL;
+    }
+}
+
+static FrameJob *frame_job_create(
+    AVFilterContext *avctx,
+    int64_t pts,
+    AVFrame *input_frame
+) {
+    FrameJob *result = av_mallocz(sizeof(FrameJob));
+    if (result == NULL) {
+        return NULL;
+    }
+    result->avctx = avctx;
+    result->pts = pts;
+    result->input_frame = input_frame;
+    return result;
+}
+
+static void frame_job_free(AVFilterContext *avctx, FrameJob **frame) {
+    cl_int cle;
+    if (*frame != NULL) {
+        av_frame_free(&(*frame)->input_frame);
+        CL_RELEASE_MEMORY((*frame)->input_buffer);
+        CL_RELEASE_MEMORY((*frame)->output_buffer);
+    }
+    av_freep(frame);
+}
+
+static void flush_queues(AVFilterContext *avctx) {
+    DewobbleOpenCLContext *ctx = avctx->priv;
+    DewobbleMessage *message = NULL;
+
+    // Flush input queue
+    while (message = ff_safe_queue_pop_front(ctx->dewobble_queue)) {
+        if (message->type == DEWOBBLE_MESSAGE_TYPE_JOB) {
+            frame_job_free(avctx, &message->job);
+        }
+        dewobble_message_free(&message);
+    }
+
+    // Flush output queue
+    while (message = ff_safe_queue_pop_front(ctx->output_queue)) {
+        if (message->type == DEWOBBLE_MESSAGE_TYPE_JOB) {
+            frame_job_free(avctx, &message->job);
+        }
+        dewobble_message_free(&message);
+    }
+}
+
 static void *dewobble_thread(void *arg) {
     AVFilterContext *avctx = arg;
     DewobbleOpenCLContext *ctx = avctx->priv;
-    DewobbleMessage *message = NULL;
+    DewobbleMessage *dewobble_message = NULL,  *output_message = NULL;
     FrameJob *job;
-    int is_eof = 0;
+    int stop = 0;
+    int err;
 
     av_log(avctx, AV_LOG_VERBOSE, "Started worker thread\n");
-    while (!is_eof) {
-        message = ff_safe_queue_pop_front_blocking(ctx->dewobble_queue);
+    while (!stop) {
+        dewobble_message = ff_safe_queue_pop_front_blocking(ctx->dewobble_queue);
 
-        if (message->type == DEWOBBLE_MESSAGE_TYPE_JOB) {
+        if (dewobble_message->type == DEWOBBLE_MESSAGE_TYPE_JOB) {
             // TODO: apply dewobbling
-            job = message->job;
+            job = dewobble_message->job;
             job->output_buffer = job->input_buffer;
             job->input_buffer = NULL;
 
-            frame_job_set_stage(job, FRAME_JOB_STAGE_WRITING_OUTPUT);
-            ff_safe_queue_push_back(ctx->output_queue, job);
-            ff_filter_set_ready(avctx, 1);
-            av_log(avctx, AV_LOG_VERBOSE, "Worker thread: pushed frame %d\n", job->num);
-        } else if (message->type == DEWOBBLE_MESSAGE_TYPE_EOF) {
-            is_eof = 1;
+            if (0) {
+                av_log(avctx, AV_LOG_ERROR, "Worker thread: error transforming frame\n");
+                frame_job_free(avctx, &job);
+                output_message = dewobble_message_create(DEWOBBLE_MESSAGE_TYPE_ERROR, NULL);
+                stop = 1;
+            } else {
+                av_log(avctx, AV_LOG_VERBOSE, "Worker thread: transformed frame %ld\n", job->num);
+                output_message = dewobble_message_create(DEWOBBLE_MESSAGE_TYPE_JOB, job);
+            }
+
+            if (output_message == NULL) {
+                av_log(avctx, AV_LOG_ERROR, "Worker thread: failed to create job message\n");
+                stop = 1;
+            } else {
+                err = ff_safe_queue_push_back(ctx->output_queue, output_message);
+                if (err == -1) {
+                    dewobble_message_free(&output_message);
+                    av_log(avctx, AV_LOG_ERROR, "Worker thread: OOM\n");
+                    stop = 1;
+                } else {
+                    ff_filter_set_ready(avctx, 1);
+                }
+            }
+
+        } else if (dewobble_message->type == DEWOBBLE_MESSAGE_TYPE_STOP) {
+            stop = 1;
         }
-        free(message);
+        dewobble_message_free(&dewobble_message);
     }
 
     av_log(avctx, AV_LOG_VERBOSE, "Worker thread: reached EOF, exiting.\n");
+
     return NULL;
+}
+
+static void stop_dewobble_thread(AVFilterContext *avctx) {
+    DewobbleOpenCLContext *ctx = avctx->priv;
+    DewobbleMessage *message = NULL;
+    int err;
+
+    if (ctx->dewobble_thread_ending == 1) {
+        return;
+    }
+    ctx->dewobble_thread_ending = 1;
+
+    message = dewobble_message_create(DEWOBBLE_MESSAGE_TYPE_STOP, NULL);
+    if (message == NULL) {
+        err = AVERROR(ENOMEM);
+        goto fail;
+    }
+    err = ff_safe_queue_push_front(ctx->dewobble_queue, message);
+    if (err == -1) {
+        err = AVERROR(ENOMEM);
+        goto fail;
+    }
+
+    return;
+
+fail:
+    av_log(avctx, AV_LOG_ERROR, "Failed to send stop message to dewobble thread, killing: %d\n", err);
+    dewobble_message_free(&message);
 }
 
 static int dewobble_opencl_init(AVFilterContext *avctx) {
     DewobbleOpenCLContext *ctx = avctx->priv;
-    ctx->frame_queue = ff_queue_create();
-    if (ctx->frame_queue == NULL) {
-        return AVERROR(ENOMEM);
-    }
     ctx->dewobble_queue = ff_safe_queue_create();
     if (ctx->dewobble_queue == NULL) {
         return AVERROR(ENOMEM);
@@ -268,12 +325,14 @@ static int dewobble_opencl_init(AVFilterContext *avctx) {
 static void dewobble_opencl_uninit(AVFilterContext *avctx) {
     cl_int cle;
     DewobbleOpenCLContext *ctx = avctx->priv;
+    av_log(avctx, AV_LOG_VERBOSE, "Uninit\n");
     if (ctx->dewobble_thread_created)
     {
+        stop_dewobble_thread(avctx);
         pthread_join(ctx->dewobble_thread, NULL);
         ctx->dewobble_thread_created = 0;
+        flush_queues(avctx);
     }
-    ff_queue_destroy(ctx->frame_queue);
     ff_safe_queue_destroy(ctx->dewobble_queue);
     ff_safe_queue_destroy(ctx->output_queue);
     if (ctx->command_queue) {
@@ -329,101 +388,32 @@ static int dewobble_opencl_config_input(AVFilterLink *inlink) {
     return 0;
 }
 
-static FrameJob *frame_job_create(
-    AVFilterContext *avctx,
-    int err,
-    int64_t pts,
-    AVFrame *input_frame
-) {
-    FrameJob *result = av_mallocz(sizeof(FrameJob));
-    if (result == NULL) {
-        return NULL;
-    }
-    result->avctx = avctx;
-    result->err = err;
-    result->pts = pts;
-    result->input_frame = input_frame;
-    ff_mutex_init(&result->mutex, NULL);
-    result->stage = FRAME_JOB_STAGE_READING_INPUT;
-    return result;
-}
-
-static void frame_job_free(FrameJob **frame) {
-    if (*frame != NULL) {
-        av_frame_free(&(*frame)->input_frame);
-        av_frame_free(&(*frame)->output_frame);
-        clReleaseMemObject((*frame)->input_buffer);
-        clReleaseMemObject((*frame)->output_buffer);
-        ff_mutex_destroy(&(*frame)->mutex);
-    }
-    av_freep(frame);
-}
-
-static int frame_job_decrement_events_remaining(FrameJob *job) {
-    int remaining;
-    ff_mutex_lock(&job->mutex);
-    remaining = --job->copy_events_remaining;
-    ff_mutex_unlock(&job->mutex);
-    return remaining;
-}
-
-static void on_buffer_create_progress(cl_event event, cl_int ret, void *data) {
-    FrameJob *job = (FrameJob *) data;
-    DewobbleMessage *message;
-    DewobbleOpenCLContext *ctx = (DewobbleOpenCLContext *) job->avctx->priv;
-    int events_remaining = frame_job_decrement_events_remaining(job);
-
-    if (events_remaining == 0) {
-        av_log(job->avctx, AV_LOG_VERBOSE, "Finished creating buffer %d\n", job->num);
-        message = dewobble_message_create(DEWOBBLE_MESSAGE_TYPE_JOB, job);
-        ret = ff_safe_queue_push_back(ctx->dewobble_queue, message);
-        if (ret < 0)
-        {
-            // TODO errors?
-        }
-    }
-}
-
-static void on_frame_create_progress(cl_event event, cl_int ret, void *data) {
-    FrameJob *job = (FrameJob *) data;
-    int events_remaining = frame_job_decrement_events_remaining(job);
-
-    if (events_remaining == 0) {
-        av_log(job->avctx, AV_LOG_VERBOSE, "Finished creating output frame %d\n", job->num);
-        frame_job_set_stage(job, FRAME_JOB_STAGE_DONE);
-        ff_filter_set_ready(job->avctx, 1);
-    }
-}
-
-static cl_int start_copy_frame_to_buffer(
+static cl_int copy_frame_to_buffer(
     AVFilterContext *avctx,
     cl_context context,
     cl_command_queue command_queue,
     FrameJob *job
 ) {
+    int err;
     AVFrame *frame = job->input_frame;
     cl_mem luma = (cl_mem) frame->data[0];
     cl_mem chroma = (cl_mem) frame->data[1];
-    cl_int ret = 0;
+    cl_int cle = 0;
     size_t src_origin[3] = { 0, 0, 0 };
     size_t luma_region[3] = { frame->width, frame->height, 1 };
     size_t chroma_region[3] = { frame->width / 2, frame->height / 2, 1 };
-    cl_event luma_finished;
-    cl_event chroma_finished;
+    cl_event copy_finished[2];
 
     job->input_buffer = clCreateBuffer(
         context,
         CL_MEM_READ_ONLY,
         frame->width * frame->height * 3 / 2,
         NULL,
-        &ret
+        &cle
     );
-    if (ret) {
-        av_log(avctx, AV_LOG_ERROR, "Failed to create buffer: %d\n", ret);
-        return ret;
-    }
+    CL_FAIL_ON_ERROR(AVERROR(ENOMEM), "Failed to create buffer: %d\n", cle);
 
-    ret = clEnqueueCopyImageToBuffer(
+    cle = clEnqueueCopyImageToBuffer(
         command_queue,
         luma,
         job->input_buffer,
@@ -432,9 +422,11 @@ static cl_int start_copy_frame_to_buffer(
         0,
         0,
         NULL,
-        &luma_finished
+        &copy_finished[0]
     );
-    ret |= clEnqueueCopyImageToBuffer(
+    CL_FAIL_ON_ERROR(AVERROR(EINVAL), "Failed to enqueue copy luma image to buffer: %d\n", cle);
+
+    cle = clEnqueueCopyImageToBuffer(
         command_queue,
         chroma,
         job->input_buffer,
@@ -443,111 +435,91 @@ static cl_int start_copy_frame_to_buffer(
         frame->width * frame->height * 1,
         0,
         NULL,
-        &chroma_finished
+        &copy_finished[1]
     );
-    if (ret) {
-        av_log(avctx, AV_LOG_ERROR, "Failed to copy images to buffer: %d\n", ret);
-        clReleaseMemObject(job->input_buffer);
-        job->input_buffer = NULL;
-        return ret;
-    }
+    CL_FAIL_ON_ERROR(AVERROR(EINVAL), "Failed to enqueue copy chroma image to buffer: %d\n", cle);
 
-    job->copy_events_remaining = 2;
-    ret = clSetEventCallback(
-        luma_finished,
-        CL_COMPLETE,
-        on_buffer_create_progress,
-        job
-    );
-    ret |= clSetEventCallback(
-        chroma_finished,
-        CL_COMPLETE,
-        on_buffer_create_progress,
-        job
-    );
+    cle = clWaitForEvents(2, copy_finished);
+    CL_FAIL_ON_ERROR(AVERROR(EINVAL), "Failed to copy images to buffer: %d\n", cle);
 
-    return ret;
+    return 0;
+
+fail:
+    CL_RELEASE_MEMORY(job->input_buffer);
+    job->input_buffer = NULL;
+    return err;
 }
 
-static int start_copy_buffer_to_frame(
+static int copy_buffer_to_frame(
     AVFilterContext *avctx,
-    AVFilterLink *outlink,
-    FrameJob *job
+    cl_mem buffer,
+    AVFrame *output_frame
 ) {
+    int err;
     DewobbleOpenCLContext *ctx = avctx->priv;
-    AVFrame *frame = job->output_frame;
-    cl_mem luma = (cl_mem) frame->data[0];
-    cl_mem chroma = (cl_mem) frame->data[1];
-    cl_int ret = 0;
+    cl_mem luma = (cl_mem) output_frame->data[0];
+    cl_mem chroma = (cl_mem) output_frame->data[1];
+    cl_int cle = 0;
     size_t dst_origin[3] = { 0, 0, 0 };
-    size_t luma_region[3] = { frame->width, frame->height, 1 };
-    size_t chroma_region[3] = { frame->width / 2, frame->height / 2, 1 };
-    cl_event luma_finished;
-    cl_event chroma_finished;
+    size_t luma_region[3] = { output_frame->width, output_frame->height, 1 };
+    size_t chroma_region[3] = { output_frame->width / 2, output_frame->height / 2, 1 };
+    cl_event copy_finished[2];
 
-    ret = clEnqueueCopyBufferToImage(
+    cle = clEnqueueCopyBufferToImage(
         ctx->command_queue,
-        job->output_buffer,
+        buffer,
         luma,
         0,
         dst_origin,
         luma_region,
         0,
         NULL,
-        &luma_finished
+        &copy_finished[0]
     );
-    ret |= clEnqueueCopyBufferToImage(
+    CL_FAIL_ON_ERROR(AVERROR(EINVAL), "Failed to enqueue copy buffer to luma image: %d\n", cle);
+    cle = clEnqueueCopyBufferToImage(
         ctx->command_queue,
-        job->output_buffer,
+        buffer,
         chroma,
-        frame->width * frame->height * 1,
+        output_frame->width * output_frame->height * 1,
         dst_origin,
         chroma_region,
         0,
         NULL,
-        &chroma_finished
+        &copy_finished[1]
     );
-    if (ret) {
-        av_log(avctx, AV_LOG_ERROR, "Failed to copy buffer to images: %d\n", ret);
-        return ret;
-    }
+    CL_FAIL_ON_ERROR(AVERROR(EINVAL), "Failed to enqueue copy buffer to luma image: %d\n", cle);
 
-    job->copy_events_remaining = 2;
-    ret = clSetEventCallback(
-        luma_finished,
-        CL_COMPLETE,
-        on_frame_create_progress,
-        job
-    );
-    ret |= clSetEventCallback(
-        chroma_finished,
-        CL_COMPLETE,
-        on_frame_create_progress,
-        job
-    );
+    cle = clWaitForEvents(2, copy_finished);
+    CL_FAIL_ON_ERROR(AVERROR(EINVAL), "Failed to copy buffer to images: %d\n", cle);
 
-    return ret;
+    return 0;
+
+fail:
+    return err;
 }
 
 static int consume_input_frame(AVFilterContext *avctx, AVFrame *input_frame) {
     DewobbleOpenCLContext *ctx = avctx->priv;
     FrameJob *job = NULL;
-    int ret = 0;
+    DewobbleMessage *message = NULL;
+    int err = 0;
+    int i;
 
-    if (!input_frame->hw_frames_ctx)
+    if (!input_frame->hw_frames_ctx) {
         return AVERROR(EINVAL);
+    }
 
     if (!ctx->initialized) {
         av_log(avctx, AV_LOG_VERBOSE, "Initializing\n");
-        ret = dewobble_opencl_frames_init(avctx);
-        if (ret < 0) {
-            return ret;
+        err = dewobble_opencl_frames_init(avctx);
+        if (err < 0) {
+            return err;
         }
     }
 
     job = frame_job_create(
         avctx,
-        0,
         input_frame->pts,
         input_frame
     );
@@ -555,19 +527,38 @@ static int consume_input_frame(AVFilterContext *avctx, AVFrame *input_frame) {
     if (job == NULL) {
         return AVERROR(ENOMEM);
     }
-    ff_queue_push_back(ctx->frame_queue, job);
 
-    ret = start_copy_frame_to_buffer(
+    err = copy_frame_to_buffer(
         avctx,
         ctx->ocf.hwctx->context,
         ctx->command_queue,
         job
     );
-    if (ret) {
-        av_log(avctx, AV_LOG_ERROR, "Failed to map OpenCL frame to OpenCL buffer: %d\n", ret);
-        return AVERROR(EINVAL);
+    if (err) {
+        goto fail;
     }
+
+    // Free original input frame buffers
+    for (i = 0; input_frame->buf[i] != NULL; i++) {
+        av_buffer_unref(&input_frame->buf[i]);
+    }
+
+    message = dewobble_message_create(DEWOBBLE_MESSAGE_TYPE_JOB, job);
+    err = ff_safe_queue_push_back(ctx->dewobble_queue, message);
+    if (err == -1) {
+        err = AVERROR(ENOMEM);
+        goto fail;
+    }
+
+    ctx->nb_frames_in_progress += 1;
+    ctx->nb_frames_consumed += 1;
+
     return 0;
+
+fail:
+    frame_job_free(avctx, &job);
+    dewobble_message_free(&message);
+    return err;
 }
 
 static int input_frame_wanted(DewobbleOpenCLContext *ctx) {
@@ -575,117 +566,127 @@ static int input_frame_wanted(DewobbleOpenCLContext *ctx) {
         + 1 + EXTRA_IN_PROGRESS_FRAMES;
 }
 
-static int try_copy_output_buffer_to_frame(
-    AVFilterContext *avctx,
-    DewobbleOpenCLContext *ctx,
-    AVFilterLink *outlink
-) {
-    int ret = 0;
-    FrameJob * job = (FrameJob *) ff_safe_queue_pop_front(ctx->output_queue);
+static int send_output_frame(AVFilterContext *avctx, FrameJob * job) {
+    AVFilterLink *inlink = avctx->inputs[0];
+    AVFilterLink *outlink = avctx->outputs[0];
+    DewobbleOpenCLContext *ctx = avctx->priv;
+    AVFrame *output_frame = NULL;
+    int err;
 
-    if (job != NULL) {
-        job->output_frame = ff_get_video_buffer(outlink, outlink->w, outlink->h);
-        av_frame_copy_props(job->output_frame, job->input_frame);
-        ret = start_copy_buffer_to_frame(avctx, outlink, job);
+    output_frame = ff_get_video_buffer(outlink, outlink->w, outlink->h);
+    if (output_frame == NULL) {
+        err = AVERROR(ENOMEM);
+        goto fail;
     }
-    return ret;
+
+    err = av_frame_copy_props(output_frame, job->input_frame);
+    if (err) {
+        av_frame_free(&output_frame);
+        goto fail;
+    }
+
+    err = copy_buffer_to_frame(avctx, job->output_buffer, output_frame);
+    if (err) {
+        av_frame_free(&output_frame);
+        goto fail;
+    }
+
+    av_log(
+        avctx,
+        AV_LOG_VERBOSE,
+        "Sending output frame %ld (%d in progress)\n",
+        job->num,
+        ctx->nb_frames_in_progress
+    );
+    ctx->nb_frames_in_progress -= 1;
+
+    err = ff_filter_frame(outlink, output_frame);
+    if (err < 0) {
+        goto fail;
+    }
+
+    if (input_frame_wanted(ctx)) {
+        ff_inlink_request_frame(inlink);
+    }
+
+    if (ctx->input_eof && ctx->nb_frames_in_progress == 0) {
+        av_log(avctx, AV_LOG_VERBOSE, "Output reached EOF\n");
+        stop_dewobble_thread(avctx);
+        ff_outlink_set_status(outlink, AVERROR_EOF, job->pts);
+    }
+    return 0;
+
+fail:
+    av_log(avctx, AV_LOG_ERROR, "Failed to send output frame: %d\n", err);
+    return err;
 }
 
-static int try_send_output_frame(
-    AVFilterContext *avctx,
-    DewobbleOpenCLContext *ctx,
-    AVFilterLink *inlink,
-    AVFilterLink *outlink
-) {
-    int ret = 0;
-    FrameJob *job = (FrameJob *) ff_queue_peek_front(ctx->frame_queue);
-    DewobbleMessage *message;
-    AVFrame *output_frame;
+static int try_send_output_frame(AVFilterContext *avctx) {
+    int err;
+    DewobbleOpenCLContext *ctx = avctx->priv;
+    DewobbleMessage *message = (DewobbleMessage *) ff_safe_queue_pop_front(ctx->output_queue);
 
-    if (job != NULL && queued_frame_get_stage(job) == FRAME_JOB_STAGE_DONE) {
-        ff_queue_pop_front(ctx->frame_queue);
-        if (job->err) {
-            ret = job->err;
-        } else {
-            av_log(
-                avctx,
-                AV_LOG_VERBOSE,
-                "Sending output frame %d (%d in progress)\n",
-                job->num,
-                ctx->nb_frames_in_progress
-            );
-            ctx->nb_frames_in_progress -= 1;
-            output_frame = av_frame_clone(job->output_frame);
-            ret = ff_filter_frame(outlink, output_frame);
-            if (ret) {
-                return ret;
-            }
-
-            if (input_frame_wanted(ctx)) {
-                ff_inlink_request_frame(inlink);
-            }
-
-            if (ctx->input_eof && ctx->nb_frames_in_progress == 0) {
-                av_log(avctx, AV_LOG_VERBOSE, "Output reached EOF\n");
-                message = dewobble_message_create(DEWOBBLE_MESSAGE_TYPE_EOF, NULL);
-                ff_safe_queue_push_back(ctx->dewobble_queue, message);
-                ff_outlink_set_status(outlink, AVERROR_EOF, job->pts);
-            }
-        }
-        frame_job_free(&job);
+    if (message == NULL) {
+        return 0;
     }
-    return ret;
+
+    if (message->type == DEWOBBLE_MESSAGE_TYPE_ERROR) {
+        av_log(avctx, AV_LOG_ERROR, "Received error message from dewobble thread\n");
+        dewobble_message_free(&message);
+        return -1;
+    }
+
+    err = send_output_frame(avctx, message->job);
+    frame_job_free(avctx, &message->job);
+    dewobble_message_free(&message);
+    if (err) {
+        return err;
+    }
+    return 0;
 }
 
-static int try_consume_input_frame(
-    AVFilterContext *avctx,
-    DewobbleOpenCLContext *ctx,
-    AVFilterLink *inlink
-) {
-    int ret = 0;
+static int try_consume_input_frame(AVFilterContext *avctx) {
+    AVFilterLink *inlink = avctx->inputs[0];
+    DewobbleOpenCLContext *ctx = avctx->priv;
+    int err = 0;
     AVFrame *input_frame;
+
     // If necessary, attempt to consume a frame from the input
     if (input_frame_wanted(ctx)) {
-        ret = ff_inlink_consume_frame(inlink, &input_frame);
-        if (ret < 0) {
+        err = ff_inlink_consume_frame(inlink, &input_frame);
+        if (err < 0) {
             av_log(avctx, AV_LOG_ERROR, "Failed to read input frame\n");
-            return ret;
-        } else if (ret > 0) {
+            return err;
+        } else if (err > 0) {
             av_log(
                 avctx,
                 AV_LOG_VERBOSE,
-                "Consuming input frame %d (%d in progress)\n",
+                "Consuming input frame %ld (%d in progress)\n",
                 ctx->nb_frames_consumed,
                 ctx->nb_frames_in_progress
             );
-            ret = consume_input_frame(avctx, input_frame);
-            ctx->nb_frames_in_progress += 1;
-            ctx->nb_frames_consumed += 1;
-            if (ret) {
-                av_log(avctx, AV_LOG_ERROR, "Failed to consume input frame\n");
-                av_frame_free(&input_frame);
-                return ret;
+            err = consume_input_frame(avctx, input_frame);
+
+            if (err) {
+                av_log(avctx, AV_LOG_ERROR, "Failed to consume input frame: %d\n", err);
+                return err;
+            }
+
+            // Request more frames if necessary
+            if (input_frame_wanted(ctx)) {
+                ff_inlink_request_frame(inlink);
             }
         }
-
-        // If we still need more input frames, request them now
-        if (input_frame_wanted(ctx)) {
-            ff_inlink_request_frame(inlink);
-        }
     }
-    return ret;
+    return err;
 }
 
-static int check_for_input_eof(
-    AVFilterContext *avctx,
-    DewobbleOpenCLContext *ctx,
-    AVFilterLink *inlink,
-    AVFilterLink *outlink
-) {
+static void check_for_input_eof(AVFilterContext *avctx) {
+    AVFilterLink *inlink = avctx->inputs[0];
+    AVFilterLink *outlink = avctx->outputs[0];
+    DewobbleOpenCLContext *ctx = avctx->priv;
     int64_t pts;
-    int ret = 0;
     int status;
-    DewobbleMessage *message;
 
     // Check for end of input
     if (!ctx->input_eof && ff_inlink_acknowledge_status(inlink, &status, &pts)) {
@@ -693,51 +694,49 @@ static int check_for_input_eof(
             av_log(avctx, AV_LOG_VERBOSE, "Reached input EOF\n");
             ctx->input_eof = 1;
             if (ctx->nb_frames_in_progress == 0) {
-                message = dewobble_message_create(DEWOBBLE_MESSAGE_TYPE_EOF, NULL);
-                ff_safe_queue_push_back(ctx->dewobble_queue, message);
+                stop_dewobble_thread(avctx);
                 ff_outlink_set_status(outlink, AVERROR_EOF, pts);
             }
         } else if (status) {
             av_log(avctx, AV_LOG_ERROR, "INPUT STATUS: %d\n", status);
         }
     }
-    return ret;
 }
 
 static int activate(AVFilterContext *avctx)
 {
     AVFilterLink *inlink = avctx->inputs[0];
     AVFilterLink *outlink = avctx->outputs[0];
-    DewobbleOpenCLContext *ctx = avctx->priv;
-    int ret = 0;
+    int err = 0;
 
-    FF_FILTER_FORWARD_STATUS_BACK(outlink, inlink);
-
-    ret = try_consume_input_frame(avctx, ctx, inlink);
-    if (ret) {
-        av_log(avctx, AV_LOG_ERROR, "CONSUME INPUT FAILED: %d\n", ret);
-        return ret;
+    err = ff_outlink_get_status(outlink);
+    if (err) {
+        av_log(avctx, AV_LOG_VERBOSE, "forwarding status to inlink: %d\n", err);
+        ff_inlink_set_status(inlink, err);
+        stop_dewobble_thread(avctx);
+        return 0;
     }
 
-    ret = check_for_input_eof(avctx, ctx, inlink, outlink);
-    if (ret) {
-        av_log(avctx, AV_LOG_ERROR, "CHECK INPUT STATUS FAILED: %d\n", ret);
-        return ret;
+    err = try_consume_input_frame(avctx);
+    if (err) {
+        av_log(avctx, AV_LOG_ERROR, "try_consume_input_frame failed: %d\n", err);
+        goto fail;
     }
 
-    ret = try_copy_output_buffer_to_frame(avctx, ctx, outlink);
-    if (ret) {
-        av_log(avctx, AV_LOG_ERROR, "COPY OUTPUT BUFFER FAILED: %d\n", ret);
-        return ret;
-    }
+    check_for_input_eof(avctx);
 
-    ret = try_send_output_frame(avctx, ctx, inlink, outlink);
-    if (ret) {
-        av_log(avctx, AV_LOG_ERROR, "SEND OUTPUT FRAME FAILED: %d\n", ret);
-        return ret;
+    err = try_send_output_frame(avctx);
+    if (err) {
+        av_log(avctx, AV_LOG_ERROR, "try_send_output_frame failed: %d\n", err);
+        goto fail;
     }
 
     return FFERROR_NOT_READY;
+
+fail:
+    stop_dewobble_thread(avctx);
+    ff_outlink_set_status(outlink, AVERROR_UNKNOWN, 0);
+    return err;
 }
 
 
