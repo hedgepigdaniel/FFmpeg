@@ -124,3 +124,13 @@ void *ff_safe_queue_pop_front(SafeQueue *sq)
     ff_mutex_unlock(&sq->mutex);
     return value;
 }
+
+void *ff_safe_queue_peek_front(SafeQueue *sq)
+{
+    void *value;
+    ff_mutex_lock(&sq->mutex);
+    value = ff_queue_peek_front(sq->q);
+    dnn_cond_signal(&sq->cond);
+    ff_mutex_unlock(&sq->mutex);
+    return value;
+}

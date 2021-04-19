@@ -95,4 +95,6 @@ void *ff_safe_queue_pop_front_blocking(SafeQueue *sq);
 
 void *ff_safe_queue_pop_front(SafeQueue *sq);
 
+void *ff_safe_queue_peek_front(SafeQueue *sq);
+
 #endif
