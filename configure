@@ -230,6 +230,7 @@ External library support:
   --enable-libdavs2        enable AVS2 decoding via libdavs2 [no]
   --enable-libdc1394       enable IIDC-1394 grabbing using libdc1394
                            and libraw1394 [no]
+  --enable-libdewobble     enable video stabilization via libdewobble [no]
   --enable-libfdk-aac      enable AAC de/encoding via libfdk-aac [no]
   --enable-libflite        enable flite (voice synthesis) support via libflite [no]
   --enable-libfontconfig   enable libfontconfig, useful for drawtext filter [no]
@@ -1802,6 +1803,7 @@ EXTERNAL_LIBRARY_LIST="
     libcodec2
     libdav1d
     libdc1394
+    libdewobble
     libdrm
     libflite
     libfontconfig
@@ -3580,7 +3582,7 @@ denoise_vaapi_filter_deps="vaapi"
 derain_filter_select="dnn"
 deshake_filter_select="pixelutils"
 deshake_opencl_filter_deps="opencl"
-dewobble_opencl_filter_deps="opencl pthreads pthread_cancel"
+dewobble_opencl_filter_deps="libdewobble opencl pthreads pthread_cancel"
 dilation_opencl_filter_deps="opencl"
 dnn_detect_filter_select="dnn"
 dnn_processing_filter_select="dnn"
@@ -6381,6 +6383,7 @@ enabled libcodec2         && require libcodec2 codec2/codec2.h codec2_create -lc
 enabled libdav1d          && require_pkg_config libdav1d "dav1d >= 0.5.0" "dav1d/dav1d.h" dav1d_version
 enabled libdavs2          && require_pkg_config libdavs2 "davs2 >= 1.6.0" davs2.h davs2_decoder_open
 enabled libdc1394         && require_pkg_config libdc1394 libdc1394-2 dc1394/dc1394.h dc1394_new
+enabled libdewobble       && require_pkg_config libdewobble dewobble dewobble/dewobble.h dewobble_filter_create
 enabled libdrm            && require_pkg_config libdrm libdrm xf86drm.h drmGetVersion
 enabled libfdk_aac        && { check_pkg_config libfdk_aac fdk-aac "fdk-aac/aacenc_lib.h" aacEncOpen ||
                                { require libfdk_aac fdk-aac/aacenc_lib.h aacEncOpen -lfdk-aac &&

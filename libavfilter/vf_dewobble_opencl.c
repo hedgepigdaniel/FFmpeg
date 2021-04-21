@@ -18,6 +18,7 @@
 #include <float.h>
 #include <pthread.h>
 #include <signal.h>
+#include <dewobble/dewobble.h>
 
 #include "libavutil/avassert.h"
 #include "libavutil/common.h"
@@ -154,7 +155,7 @@ typedef struct FrameJob {
 
 typedef enum DewobbleMessageType {
     DEWOBBLE_MESSAGE_TYPE_JOB,
-    DEWOBBLE_MESSAGE_TYPE_STOP,
+    DEWOBBLE_MESSAGE_TYPE_EOF,
     DEWOBBLE_MESSAGE_TYPE_ERROR
 } DewobbleMessageType;
 
@@ -228,60 +229,142 @@ static void flush_queues(AVFilterContext *avctx) {
     }
 }
 
+static int pull_ready_frames(
+    AVFilterContext *avctx,
+    DewobbleFilter filter
+) {
+    int err;
+    DewobbleOpenCLContext *ctx = avctx->priv;
+    cl_mem output_buffer;
+    FrameJob *job = NULL;
+    DewobbleMessage *output_message = NULL;
+
+    while (dewobble_filter_frame_ready(filter)) {
+        err = dewobble_filter_pull_frame(filter, &output_buffer, (void **) &job);
+        if (err) {
+            av_log(avctx, AV_LOG_ERROR, "Worker thread: failed to pull frame from dewobbler\n");
+            goto fail;
+        }
+        job->output_buffer = output_buffer;
+
+        output_message = dewobble_message_create(DEWOBBLE_MESSAGE_TYPE_JOB, job);
+        if (output_message == NULL) {
+            goto fail;
+        }
+
+        av_log(avctx, AV_LOG_VERBOSE, "Worker thread: sent frame %ld\n", job->num);
+        err = ff_safe_queue_push_back(ctx->output_queue, output_message);
+        if (err == -1) {
+            goto fail;
+        }
+    }
+    ff_filter_set_ready(avctx, 1);
+
+    return 0;
+
+fail:
+    clReleaseMemObject(output_buffer);
+    dewobble_message_free(&output_message);
+    return err;
+}
+
 static void *dewobble_thread(void *arg) {
     AVFilterContext *avctx = arg;
     DewobbleOpenCLContext *ctx = avctx->priv;
     DewobbleMessage *dewobble_message = NULL,  *output_message = NULL;
     FrameJob *job;
-    int stop = 0;
-    int err;
+    DewobbleFilter filter = NULL;
+    DewobbleCamera input_camera = NULL, output_camera = NULL;
+    DewobbleStabilizer stabilizer = NULL;
+    int input_eof = 0;
+    int err = 0;
 
-    av_log(avctx, AV_LOG_VERBOSE, "Started worker thread\n");
-    while (!stop) {
+    dewobble_init_opencl_context(ctx->ocf.hwctx->context, ctx->ocf.hwctx->device_id);
+
+    input_camera = dewobble_camera_create(
+        DEWOBBLE_PROJECTION_EQUIDISTANT_FISHEYE,
+        ctx->input_camera.focal_length,
+        ctx->ocf.output_width,
+        ctx->ocf.output_height
+    );
+    output_camera = dewobble_camera_create(
+        DEWOBBLE_PROJECTION_RECTILINEAR,
+        ctx->output_camera.focal_length,
+        ctx->ocf.output_width,
+        ctx->ocf.output_height
+    );
+    switch(ctx->stabilization_algorithm) {
+        case STABILIZATION_ALGORITHM_ORIGINAL:
+            stabilizer = dewobble_stabilizer_create_none();
+            break;
+         case STABILIZATION_ALGORITHM_FIXED:
+            stabilizer = dewobble_stabilizer_create_fixed(input_camera);
+            break;
+        case STABILIZATION_ALGORITHM_SMOOTH:
+            stabilizer = dewobble_stabilizer_create_savitzky_golay(input_camera, ctx->stabilization_radius);
+            break;
+    }
+    filter = dewobble_filter_create(input_camera, output_camera, stabilizer);
+    if (filter == NULL) {
+        av_log(avctx, AV_LOG_ERROR, "Worker thread: failed to create libdewobble filter\n");
+        err = 1;
+    }
+
+    while (!err && !input_eof) {
         dewobble_message = ff_safe_queue_pop_front_blocking(ctx->dewobble_queue);
 
-        if (dewobble_message->type == DEWOBBLE_MESSAGE_TYPE_JOB) {
-            // TODO: apply dewobbling
-            job = dewobble_message->job;
-            job->output_buffer = job->input_buffer;
-            job->input_buffer = NULL;
+        switch (dewobble_message->type) {
+            case DEWOBBLE_MESSAGE_TYPE_JOB:
+                job = dewobble_message->job;
 
-            if (0) {
-                av_log(avctx, AV_LOG_ERROR, "Worker thread: error transforming frame\n");
-                frame_job_free(avctx, &job);
-                output_message = dewobble_message_create(DEWOBBLE_MESSAGE_TYPE_ERROR, NULL);
-                stop = 1;
-            } else {
-                av_log(avctx, AV_LOG_VERBOSE, "Worker thread: transformed frame %ld\n", job->num);
-                output_message = dewobble_message_create(DEWOBBLE_MESSAGE_TYPE_JOB, job);
-            }
-
-            if (output_message == NULL) {
-                av_log(avctx, AV_LOG_ERROR, "Worker thread: failed to create job message\n");
-                stop = 1;
-            } else {
-                err = ff_safe_queue_push_back(ctx->output_queue, output_message);
-                if (err == -1) {
-                    dewobble_message_free(&output_message);
-                    av_log(avctx, AV_LOG_ERROR, "Worker thread: OOM\n");
-                    stop = 1;
-                } else {
-                    ff_filter_set_ready(avctx, 1);
+                av_log(avctx, AV_LOG_VERBOSE, "Worker thread: transforming frame %ld\n", job->num);
+                err = dewobble_filter_push_frame(filter, job->input_buffer, job);
+                if (err) {
+                    frame_job_free(avctx, &job);
+                    av_log(avctx, AV_LOG_ERROR, "Worker thread: failed to push %ld\n", job->num);
+                    break;
                 }
-            }
-
-        } else if (dewobble_message->type == DEWOBBLE_MESSAGE_TYPE_STOP) {
-            stop = 1;
+                job = NULL;
+                err = pull_ready_frames(avctx, filter);
+                if (err) {
+                    av_log(avctx, AV_LOG_ERROR, "Worker thread: failed to pull frames\n");
+                }
+                break;
+            case DEWOBBLE_MESSAGE_TYPE_EOF:
+                av_log(avctx, AV_LOG_VERBOSE, "Worker thread: reached end of input\n");
+                input_eof = 1;
+                err = dewobble_filter_end_input(filter);
+                if (err) {
+                    av_log(avctx, AV_LOG_ERROR, "Worker thread: failed to end input\n");
+                    break;
+                }
+                err = pull_ready_frames(avctx, filter);
+                if (err) {
+                    av_log(avctx, AV_LOG_ERROR, "Worker thread: failed to pull frames\n");
+                }
+                break;
+            case DEWOBBLE_MESSAGE_TYPE_ERROR:
+                err = 1;
+                break;
         }
         dewobble_message_free(&dewobble_message);
     }
 
-    av_log(avctx, AV_LOG_VERBOSE, "Worker thread: reached EOF, exiting.\n");
+    if (err) {
+        output_message = dewobble_message_create(DEWOBBLE_MESSAGE_TYPE_ERROR, NULL);
+        if (output_message != NULL) {
+            ff_safe_queue_push_back(ctx->output_queue, output_message);
+            ff_filter_set_ready(avctx, 1);
+        }
+    }
 
+    dewobble_filter_destroy(filter);
+    dewobble_camera_destroy(input_camera);
+    dewobble_camera_destroy(output_camera);
     return NULL;
 }
 
-static void stop_dewobble_thread(AVFilterContext *avctx) {
+static void send_eof_to_dewobble_thread(AVFilterContext *avctx) {
     DewobbleOpenCLContext *ctx = avctx->priv;
     DewobbleMessage *message = NULL;
     int err;
@@ -291,7 +374,35 @@ static void stop_dewobble_thread(AVFilterContext *avctx) {
     }
     ctx->dewobble_thread_ending = 1;
 
-    message = dewobble_message_create(DEWOBBLE_MESSAGE_TYPE_STOP, NULL);
+    message = dewobble_message_create(DEWOBBLE_MESSAGE_TYPE_EOF, NULL);
+    if (message == NULL) {
+        err = AVERROR(ENOMEM);
+        goto fail;
+    }
+    err = ff_safe_queue_push_back(ctx->dewobble_queue, message);
+    if (err == -1) {
+        err = AVERROR(ENOMEM);
+        goto fail;
+    }
+
+    return;
+
+fail:
+    av_log(avctx, AV_LOG_ERROR, "Failed to send EOF to dewobble thread: %d\n", err);
+    dewobble_message_free(&message);
+}
+
+static void stop_dewobble_thread_on_error(AVFilterContext *avctx) {
+    DewobbleOpenCLContext *ctx = avctx->priv;
+    DewobbleMessage *message = NULL;
+    int err;
+
+    if (ctx->dewobble_thread_ending == 1) {
+        return;
+    }
+    ctx->dewobble_thread_ending = 1;
+
+    message = dewobble_message_create(DEWOBBLE_MESSAGE_TYPE_ERROR, NULL);
     if (message == NULL) {
         err = AVERROR(ENOMEM);
         goto fail;
@@ -305,7 +416,7 @@ static void stop_dewobble_thread(AVFilterContext *avctx) {
     return;
 
 fail:
-    av_log(avctx, AV_LOG_ERROR, "Failed to send stop message to dewobble thread, killing: %d\n", err);
+    av_log(avctx, AV_LOG_ERROR, "Failed to send stop message to dewobble thread: %d\n", err);
     dewobble_message_free(&message);
 }
 
@@ -328,7 +439,7 @@ static void dewobble_opencl_uninit(AVFilterContext *avctx) {
     av_log(avctx, AV_LOG_VERBOSE, "Uninit\n");
     if (ctx->dewobble_thread_created)
     {
-        stop_dewobble_thread(avctx);
+        stop_dewobble_thread_on_error(avctx);
         pthread_join(ctx->dewobble_thread, NULL);
         ctx->dewobble_thread_created = 0;
         flush_queues(avctx);
@@ -562,7 +673,10 @@ fail:
 }
 
 static int input_frame_wanted(DewobbleOpenCLContext *ctx) {
-    return !ctx->input_eof && ctx->nb_frames_in_progress < ctx->stabilization_radius
+    int nb_buffered_frames = ctx->stabilization_algorithm == STABILIZATION_ALGORITHM_SMOOTH
+        ? ctx->stabilization_radius
+        : 0;
+    return !ctx->input_eof && ctx->nb_frames_in_progress < nb_buffered_frames
         + 1 + EXTRA_IN_PROGRESS_FRAMES;
 }
 
@@ -611,7 +725,7 @@ static int send_output_frame(AVFilterContext *avctx, FrameJob * job) {
 
     if (ctx->input_eof && ctx->nb_frames_in_progress == 0) {
         av_log(avctx, AV_LOG_VERBOSE, "Output reached EOF\n");
-        stop_dewobble_thread(avctx);
+        send_eof_to_dewobble_thread(avctx);
         ff_outlink_set_status(outlink, AVERROR_EOF, job->pts);
     }
     return 0;
@@ -693,8 +807,8 @@ static void check_for_input_eof(AVFilterContext *avctx) {
         if (status == AVERROR_EOF) {
             av_log(avctx, AV_LOG_VERBOSE, "Reached input EOF\n");
             ctx->input_eof = 1;
+            send_eof_to_dewobble_thread(avctx);
             if (ctx->nb_frames_in_progress == 0) {
-                stop_dewobble_thread(avctx);
                 ff_outlink_set_status(outlink, AVERROR_EOF, pts);
             }
         } else if (status) {
@@ -713,7 +827,7 @@ static int activate(AVFilterContext *avctx)
     if (err) {
         av_log(avctx, AV_LOG_VERBOSE, "forwarding status to inlink: %d\n", err);
         ff_inlink_set_status(inlink, err);
-        stop_dewobble_thread(avctx);
+        stop_dewobble_thread_on_error(avctx);
         return 0;
     }
 
@@ -734,7 +848,7 @@ static int activate(AVFilterContext *avctx)
     return FFERROR_NOT_READY;
 
 fail:
-    stop_dewobble_thread(avctx);
+    stop_dewobble_thread_on_error(avctx);
     ff_outlink_set_status(outlink, AVERROR_UNKNOWN, 0);
     return err;
 }
@@ -868,7 +982,7 @@ static const AVOption dewobble_opencl_options[] = {
         "smooth the camera orientation using a Savitzky-Golay filter",
         0,
         AV_OPT_TYPE_CONST,
-        { .i64 = STABILIZATION_ALGORITHM_FIXED },
+        { .i64 = STABILIZATION_ALGORITHM_SMOOTH },
         INT_MIN,
         INT_MAX,
         FLAGS,
