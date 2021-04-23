@@ -38,29 +38,26 @@
 #include "transpose.h"
 #include "video.h"
 
-// Camera projection model
-typedef enum CameraModel {
-
-    // Rectilinear projection (`r = f * tan(theta)`)
-    CAMERA_MODEL_RECTILINEAR,
-
-    // Equidistant fisheye projection (`r = f * theta`)
-    CAMERA_MODEL_EQUIDISTANT_FISHEYE,
-
-    // Number of camera projection models
-    NB_CAMERA_MODELS,
-
-} CameraModel;
-
 // Camera properties
 typedef struct Camera {
 
     // Camera projection model
-    CameraModel model;
+    int model;
 
     // Camera focal length in pixels
     double focal_length;
 
+    // Width in pixels
+    int width;
+
+    // Height in pixels
+    int height;
+
+    // Horizonal coordinate of focal point in pixels
+    double focal_point_x;
+
+    // Vertical coordinate of focal point in pixels
+    double focal_point_y;
 } Camera;
 
 //  Motion stabilization algorithm
@@ -95,11 +92,14 @@ typedef struct DewobbleOpenCLContext {
     Camera output_camera;
 
     // Stabilization algorithm applied by the filter
-    StabilizationAlgorithm stabilization_algorithm;
+    int stabilization_algorithm;
 
     // The number of frames to look ahead and behind for the purpose of stabilizing
     // each frame
     int stabilization_radius;
+
+    // The algorithm to interpolate the value between source image pixels
+    int interpolation_algorithm;
 
     // Whether the filter has been initialized
     int initialized;
@@ -282,16 +282,20 @@ static void *dewobble_thread(void *arg) {
     dewobble_init_opencl_context(ctx->ocf.hwctx->context, ctx->ocf.hwctx->device_id);
 
     input_camera = dewobble_camera_create(
-        DEWOBBLE_PROJECTION_EQUIDISTANT_FISHEYE,
+        ctx->input_camera.model,
         ctx->input_camera.focal_length,
-        ctx->ocf.output_width,
-        ctx->ocf.output_height
+        ctx->input_camera.width,
+        ctx->input_camera.height,
+        ctx->input_camera.focal_point_x,
+        ctx->input_camera.focal_point_y
     );
     output_camera = dewobble_camera_create(
-        DEWOBBLE_PROJECTION_RECTILINEAR,
+        ctx->output_camera.model,
         ctx->output_camera.focal_length,
-        ctx->ocf.output_width,
-        ctx->ocf.output_height
+        ctx->output_camera.width,
+        ctx->output_camera.height,
+        ctx->output_camera.focal_point_x,
+        ctx->output_camera.focal_point_y
     );
     switch(ctx->stabilization_algorithm) {
         case STABILIZATION_ALGORITHM_ORIGINAL:
@@ -304,7 +308,12 @@ static void *dewobble_thread(void *arg) {
             stabilizer = dewobble_stabilizer_create_savitzky_golay(input_camera, ctx->stabilization_radius);
             break;
     }
-    filter = dewobble_filter_create(input_camera, output_camera, stabilizer);
+    filter = dewobble_filter_create(
+        input_camera,
+        output_camera,
+        stabilizer,
+        ctx->interpolation_algorithm
+    );
     if (filter == NULL) {
         av_log(avctx, AV_LOG_ERROR, "Worker thread: failed to create libdewobble filter\n");
         err = 1;
@@ -422,6 +431,16 @@ fail:
 
 static int dewobble_opencl_init(AVFilterContext *avctx) {
     DewobbleOpenCLContext *ctx = avctx->priv;
+    if (ctx->input_camera.model == DEWOBBLE_NB_PROJECTIONS
+        || ctx->output_camera.model == DEWOBBLE_NB_PROJECTIONS
+    ) {
+        av_log(avctx, AV_LOG_ERROR, "both in_p and out_p must be set\n");
+        return AVERROR(EINVAL);
+    }
+    if (ctx->input_camera.focal_length == 0 || ctx->output_camera.focal_length == 0) {
+        av_log(avctx, AV_LOG_ERROR, "both in_fl and out_fl must be set\n");
+        return AVERROR(EINVAL);
+    }
     ctx->dewobble_queue = ff_safe_queue_create();
     if (ctx->dewobble_queue == NULL) {
         return AVERROR(ENOMEM);
@@ -495,7 +514,33 @@ static int dewobble_opencl_config_input(AVFilterLink *inlink) {
         return AVERROR(ENOSYS);
     }
 
-    // TODO: change output width/height
+    ctx->input_camera.width = inlink->w;
+    ctx->input_camera.height = inlink->h;
+
+    // Output camera defaults to the same resolution as the input
+    if (ctx->output_camera.width == 0) {
+        ctx->output_camera.width = ctx->input_camera.width;
+    }
+    if (ctx->output_camera.height == 0) {
+        ctx->output_camera.height = ctx->input_camera.height;
+    }
+    ctx->ocf.output_width = ctx->output_camera.width;
+    ctx->ocf.output_height = ctx->output_camera.height;
+
+    // Focal points default to the image center
+    if (ctx->input_camera.focal_point_x == DBL_MAX) {
+        ctx->input_camera.focal_point_x = (ctx->input_camera.width - 1) / 2.0;
+    }
+    if (ctx->input_camera.focal_point_y == DBL_MAX) {
+        ctx->input_camera.focal_point_y = (ctx->input_camera.height - 1) / 2.0;
+    }
+    if (ctx->output_camera.focal_point_x == DBL_MAX) {
+        ctx->output_camera.focal_point_x = (ctx->output_camera.width - 1) / 2.0;
+    }
+    if (ctx->output_camera.focal_point_y == DBL_MAX) {
+        ctx->output_camera.focal_point_y = (ctx->output_camera.height - 1) / 2.0;
+    }
+
     return 0;
 }
 
@@ -619,6 +664,16 @@ static int consume_input_frame(AVFilterContext *avctx, AVFrame *input_frame) {
 
     if (!input_frame->hw_frames_ctx) {
         return AVERROR(EINVAL);
+    }
+
+    if (input_frame->crop_top || input_frame->crop_bottom ||
+        input_frame->crop_left || input_frame->crop_right
+    ) {
+        av_log(
+            avctx,
+            AV_LOG_WARNING,
+            "Cropping information discarded from input (code not written yet)\n"
+        );
     }
 
     if (!ctx->initialized) {
@@ -860,18 +915,18 @@ fail:
 static const AVOption dewobble_opencl_options[] = {
     // Input camera options
     {
-        "input_model",
+        "in_p",
         "input camera projection model",
         OFFSET(input_camera) + OFFSET_CAMERA(model),
         AV_OPT_TYPE_INT,
-        { .i64 = NB_CAMERA_MODELS },
+        { .i64 = DEWOBBLE_PROJECTION_EQUIDISTANT_FISHEYE },
         0,
-        NB_CAMERA_MODELS - 1,
+        DEWOBBLE_NB_PROJECTIONS - 1,
         FLAGS,
         "model",
     },
     {
-        "input_focal",
+        "in_fl",
         "input camera focal length in pixels",
         OFFSET(input_camera) + OFFSET_CAMERA(focal_length),
         AV_OPT_TYPE_DOUBLE,
@@ -879,23 +934,42 @@ static const AVOption dewobble_opencl_options[] = {
         0,
         DBL_MAX,
         .flags=FLAGS,
-        .unit = "in_f",
+    },
+    {
+        "in_fx",
+        "horizontal coordinate of focal point in input camera (default: center)",
+        OFFSET(input_camera) + OFFSET_CAMERA(focal_point_x),
+        AV_OPT_TYPE_DOUBLE,
+        { .dbl = DBL_MAX },
+        -DBL_MAX,
+        DBL_MAX,
+        .flags=FLAGS,
+    },
+    {
+        "in_fy",
+        "vertical coordinate of focal point in input camera (default: center)",
+        OFFSET(input_camera) + OFFSET_CAMERA(focal_point_y),
+        AV_OPT_TYPE_DOUBLE,
+        { .dbl = DBL_MAX },
+        -DBL_MAX,
+        DBL_MAX,
+        .flags=FLAGS,
     },
 
     // Output camera options
     {
-        "output_model",
+        "out_p",
         "output camera projection model",
         OFFSET(output_camera) + OFFSET_CAMERA(model),
         AV_OPT_TYPE_INT,
-        { .i64 = NB_CAMERA_MODELS },
+        { .i64 = DEWOBBLE_PROJECTION_RECTILINEAR },
         0,
-        NB_CAMERA_MODELS - 1,
+        DEWOBBLE_NB_PROJECTIONS - 1,
         FLAGS,
         "model",
     },
     {
-        "output_focal",
+        "out_fl",
         "output camera focal length in pixels",
         OFFSET(output_camera) + OFFSET_CAMERA(focal_length),
         AV_OPT_TYPE_DOUBLE,
@@ -903,7 +977,46 @@ static const AVOption dewobble_opencl_options[] = {
         0,
         DBL_MAX,
         .flags=FLAGS,
-        .unit = "out_f",
+    },
+    {
+        "out_w",
+        "output camera width in pixels (default: same as input)",
+        OFFSET(output_camera) + OFFSET_CAMERA(width),
+        AV_OPT_TYPE_INT,
+        { .i64 = 0 },
+        0,
+        SHRT_MAX,
+        .flags=FLAGS,
+    },
+    {
+        "out_h",
+        "output camera height in pixels (default: same as input)",
+        OFFSET(output_camera) + OFFSET_CAMERA(height),
+        AV_OPT_TYPE_INT,
+        { .i64 = 0 },
+        0,
+        SHRT_MAX,
+        .flags=FLAGS,
+    },
+    {
+        "out_fx",
+        "horizontal coordinate of focal point in output camera (default: center)",
+        OFFSET(output_camera) + OFFSET_CAMERA(focal_point_x),
+        AV_OPT_TYPE_DOUBLE,
+        { .dbl = DBL_MAX },
+        -DBL_MAX,
+        DBL_MAX,
+        .flags=FLAGS,
+    },
+    {
+        "out_fy",
+        "vertical coordinate of focal point in output camera (default: center)",
+        OFFSET(output_camera) + OFFSET_CAMERA(focal_point_y),
+        AV_OPT_TYPE_DOUBLE,
+        { .dbl = DBL_MAX },
+        -DBL_MAX,
+        DBL_MAX,
+        .flags=FLAGS,
     },
 
     // Stabilization options
@@ -919,7 +1032,7 @@ static const AVOption dewobble_opencl_options[] = {
         "stab",
     },
     {
-        "stab_radius",
+        "stab_r",
         "for Savitzky-Golay smoothing: the number of frames to look ahead and behind",
         OFFSET(stabilization_radius),
         AV_OPT_TYPE_INT,
@@ -930,24 +1043,37 @@ static const AVOption dewobble_opencl_options[] = {
         "radius",
     },
 
+    // General options
+    {
+        "interp",
+        "interpolation algorithm",
+        OFFSET(interpolation_algorithm),
+        AV_OPT_TYPE_INT,
+        { .i64 = DEWOBBLE_INTERPOLATION_LINEAR },
+        0,
+        DEWOBBLE_NB_INTERPOLATIONS - 1,
+        FLAGS,
+        "interpolation",
+    },
+
     // Camera models
     {
-        "rectilinear",
+        "rect",
         "rectilinear projection",
         0,
         AV_OPT_TYPE_CONST,
-        { .i64 = CAMERA_MODEL_RECTILINEAR },
+        { .i64 = DEWOBBLE_PROJECTION_RECTILINEAR },
         INT_MIN,
         INT_MAX,
         FLAGS,
         "model"
     },
     {
-        "fisheye",
+        "fish",
         "equidistant fisheye projection",
         0,
         AV_OPT_TYPE_CONST,
-        { .i64 = CAMERA_MODEL_EQUIDISTANT_FISHEYE },
+        { .i64 = DEWOBBLE_PROJECTION_EQUIDISTANT_FISHEYE },
         INT_MIN,
         INT_MAX,
         FLAGS,
@@ -967,8 +1093,8 @@ static const AVOption dewobble_opencl_options[] = {
         "stab"
     },
     {
-        "original",
-        "maintain the camera orientation from the input (do not apply stabilization)",
+        "none",
+        "do not apply stabilization",
         0,
         AV_OPT_TYPE_CONST,
         { .i64 = STABILIZATION_ALGORITHM_ORIGINAL },
@@ -978,7 +1104,7 @@ static const AVOption dewobble_opencl_options[] = {
         "stab"
     },
     {
-        "smooth",
+        "sg",
         "smooth the camera orientation using a Savitzky-Golay filter",
         0,
         AV_OPT_TYPE_CONST,
@@ -987,6 +1113,52 @@ static const AVOption dewobble_opencl_options[] = {
         INT_MAX,
         FLAGS,
         "stab"
+    },
+
+    // Interpolation algorithms
+    {
+        "nearest",
+        "nearest neighbour interpolation (fast)",
+        0,
+        AV_OPT_TYPE_CONST,
+        { .i64 = DEWOBBLE_INTERPOLATION_NEAREST },
+        INT_MIN,
+        INT_MAX,
+        FLAGS,
+        "interpolation"
+    },
+    {
+        "linear",
+        "bilinear interpolation (fast)",
+        0,
+        AV_OPT_TYPE_CONST,
+        { .i64 = DEWOBBLE_INTERPOLATION_LINEAR },
+        INT_MIN,
+        INT_MAX,
+        FLAGS,
+        "interpolation"
+    },
+    {
+        "cubic",
+        "bicubic interpolation (medium)",
+        0,
+        AV_OPT_TYPE_CONST,
+        { .i64 = DEWOBBLE_INTERPOLATION_CUBIC },
+        INT_MIN,
+        INT_MAX,
+        FLAGS,
+        "interpolation"
+    },
+    {
+        "lanczos",
+        "Lanczos4, in an 8x8 neighbourhood (slow)",
+        0,
+        AV_OPT_TYPE_CONST,
+        { .i64 = DEWOBBLE_INTERPOLATION_LANCZOS4 },
+        INT_MIN,
+        INT_MAX,
+        FLAGS,
+        "interpolation"
     },
 
     { NULL }
