@@ -98,6 +98,10 @@ typedef struct DewobbleOpenCLContext {
     // each frame
     int stabilization_radius;
 
+    // The number of frames to look ahead for the purpose of interpolating
+    // frame rotation for frames where detection fails
+    int stabilization_horizon;
+
     // The algorithm to interpolate the value between source image pixels
     int interpolation_algorithm;
 
@@ -312,10 +316,17 @@ static void *dewobble_thread(void *arg) {
             stabilizer = dewobble_stabilizer_create_none();
             break;
          case STABILIZATION_ALGORITHM_FIXED:
-            stabilizer = dewobble_stabilizer_create_fixed(input_camera);
+            stabilizer = dewobble_stabilizer_create_fixed(
+                input_camera,
+                ctx->stabilization_horizon
+            );
             break;
         case STABILIZATION_ALGORITHM_SMOOTH:
-            stabilizer = dewobble_stabilizer_create_savitzky_golay(input_camera, ctx->stabilization_radius);
+            stabilizer = dewobble_stabilizer_create_savitzky_golay(
+                input_camera,
+                ctx->stabilization_radius,
+                ctx->stabilization_horizon
+            );
             break;
     }
     filter = dewobble_filter_create(
@@ -450,6 +461,9 @@ static int dewobble_opencl_init(AVFilterContext *avctx) {
     if (ctx->input_camera.focal_length == 0 || ctx->output_camera.focal_length == 0) {
         av_log(avctx, AV_LOG_ERROR, "both in_fl and out_fl must be set\n");
         return AVERROR(EINVAL);
+    }
+    if (ctx->stabilization_algorithm == STABILIZATION_ALGORITHM_ORIGINAL) {
+        ctx->stabilization_horizon = 0;
     }
     ctx->dewobble_queue = ff_safe_queue_create();
     if (ctx->dewobble_queue == NULL) {
@@ -741,6 +755,7 @@ static int input_frame_wanted(DewobbleOpenCLContext *ctx) {
     int nb_buffered_frames = ctx->stabilization_algorithm == STABILIZATION_ALGORITHM_SMOOTH
         ? ctx->stabilization_radius
         : 0;
+    nb_buffered_frames += ctx->stabilization_horizon;
     return !ctx->input_eof && ctx->nb_frames_in_progress < nb_buffered_frames
         + 1 + EXTRA_IN_PROGRESS_FRAMES;
 }
@@ -1050,7 +1065,16 @@ static const AVOption dewobble_opencl_options[] = {
         1,
         INT_MAX,
         FLAGS,
-        "radius",
+    },
+    {
+        "stab_h",
+        "for stabilization: the number of frames to look ahead to interpolate rotation in frames where it cannot be detected",
+        OFFSET(stabilization_horizon),
+        AV_OPT_TYPE_INT,
+        { .i64 = 30 },
+        0,
+        INT_MAX,
+        FLAGS,
     },
 
     // General options
