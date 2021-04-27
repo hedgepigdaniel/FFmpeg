@@ -244,17 +244,7 @@ static int pull_ready_frames(
     DewobbleMessage *output_message = NULL;
 
     while (dewobble_filter_frame_ready(filter)) {
-        output_buffer = clCreateBuffer(
-            ctx->ocf.hwctx->context,
-            CL_MEM_WRITE_ONLY,
-            ctx->output_camera.width * ctx->output_camera.height * 3 / 2,
-            NULL,
-            NULL
-        );
-        if (output_buffer == NULL) {
-            goto fail;
-        }
-        err = dewobble_filter_pull_frame(filter, output_buffer, (void **) &job);
+        err = dewobble_filter_pull_frame(filter, &output_buffer, (void **) &job);
         if (err) {
             av_log(avctx, AV_LOG_ERROR, "Worker thread: failed to pull frame from dewobbler\n");
             goto fail;
