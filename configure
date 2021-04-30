@@ -1781,6 +1781,7 @@ EXTERNAL_LIBRARY_VERSION3_LIST="
 "
 
 EXTERNAL_LIBRARY_GPLV3_LIST="
+    libdewobble
     libsmbclient
 "
 
@@ -1803,7 +1804,6 @@ EXTERNAL_LIBRARY_LIST="
     libcodec2
     libdav1d
     libdc1394
-    libdewobble
     libdrm
     libflite
     libfontconfig
