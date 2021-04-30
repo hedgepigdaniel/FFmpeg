@@ -499,11 +499,66 @@ static void dewobble_opencl_uninit(AVFilterContext *avctx) {
     ff_opencl_filter_uninit(avctx);
 }
 
-static int dewobble_opencl_frames_init(AVFilterContext *avctx)
+static int dewobble_opencl_frames_init(AVFilterContext *avctx, AVFrame *first_frame)
 {
     DewobbleOpenCLContext *ctx = avctx->priv;
+    AVFilterLink *inlink = avctx->inputs[0];
     cl_int cle;
     int err;
+
+    if (first_frame->crop_top % 2 == 1 || first_frame->crop_bottom % 2 == 1 ||
+        first_frame->crop_left % 2 == 1 || first_frame->crop_right % 2 == 1)
+    {
+        av_log(
+            avctx,
+            AV_LOG_ERROR,
+            "Cropping by an odd number of pixels is not supported!\n"
+        );
+        return AVERROR(EINVAL);
+    }
+
+    if ((first_frame->crop_top || first_frame->crop_bottom) &&
+        (ctx->output_camera.height == 0 || ctx->output_camera.focal_point_y == DBL_MAX))
+    {
+        av_log(
+            avctx,
+            AV_LOG_WARNING,
+            "Input is vertically cropped, but output height or vertical focal point "
+            "is not set. The default values are based on the uncropped input!\n"
+        );
+    }
+
+    if ((first_frame->crop_left || first_frame->crop_right) &&
+        (ctx->output_camera.width == 0 || ctx->output_camera.focal_point_x == DBL_MAX))
+    {
+        av_log(
+            avctx,
+            AV_LOG_WARNING,
+            "Input is horizontally cropped, but output width or horizontal focal point "
+            "is not set. The default values are based on the uncropped input!\n"
+        );
+    }
+
+    ctx->input_camera.width = inlink->w - first_frame->crop_left - first_frame->crop_right;
+    ctx->input_camera.height = inlink->h - first_frame->crop_top - first_frame->crop_bottom;
+
+    // Output camera width must match the filter output
+    ctx->output_camera.width = ctx->ocf.output_width;
+    ctx->output_camera.height = ctx->ocf.output_height;
+
+    // Focal points default to the image center (disregarding cropping)
+    if (ctx->input_camera.focal_point_x == DBL_MAX) {
+        ctx->input_camera.focal_point_x = (inlink->w - 1) / 2.0 - first_frame->crop_left;
+    }
+    if (ctx->input_camera.focal_point_y == DBL_MAX) {
+        ctx->input_camera.focal_point_y = (inlink->h - 1) / 2.0 - first_frame->crop_top;
+    }
+    if (ctx->output_camera.focal_point_x == DBL_MAX) {
+        ctx->output_camera.focal_point_x = (ctx->output_camera.width - 1) / 2.0;
+    }
+    if (ctx->output_camera.focal_point_y == DBL_MAX) {
+        ctx->output_camera.focal_point_y = (ctx->output_camera.height - 1) / 2.0;
+    }
 
     ctx->command_queue = clCreateCommandQueue(ctx->ocf.hwctx->context,
                                               ctx->ocf.hwctx->device_id,
@@ -539,32 +594,21 @@ static int dewobble_opencl_config_input(AVFilterLink *inlink) {
         return AVERROR(ENOSYS);
     }
 
-    ctx->input_camera.width = inlink->w;
-    ctx->input_camera.height = inlink->h;
+    if (inlink->w % 2 == 1 || inlink->h % 2 == 1) {
+        av_log(avctx, AV_LOG_ERROR, "Input with odd dimensions is not supported!\n");
+        return AVERROR(EINVAL);
+    }
 
-    // Output camera defaults to the same resolution as the input
-    if (ctx->output_camera.width == 0) {
-        ctx->output_camera.width = ctx->input_camera.width;
+    if (ctx->output_camera.width % 2 == 1 || ctx->output_camera.height % 2 == 1) {
+        av_log(avctx, AV_LOG_ERROR, "Output camera must have even dimensions!\n");
+        return AVERROR(EINVAL);
     }
-    if (ctx->output_camera.height == 0) {
-        ctx->output_camera.height = ctx->input_camera.height;
-    }
-    ctx->ocf.output_width = ctx->output_camera.width;
-    ctx->ocf.output_height = ctx->output_camera.height;
 
-    // Focal points default to the image center
-    if (ctx->input_camera.focal_point_x == DBL_MAX) {
-        ctx->input_camera.focal_point_x = (ctx->input_camera.width - 1) / 2.0;
-    }
-    if (ctx->input_camera.focal_point_y == DBL_MAX) {
-        ctx->input_camera.focal_point_y = (ctx->input_camera.height - 1) / 2.0;
-    }
-    if (ctx->output_camera.focal_point_x == DBL_MAX) {
-        ctx->output_camera.focal_point_x = (ctx->output_camera.width - 1) / 2.0;
-    }
-    if (ctx->output_camera.focal_point_y == DBL_MAX) {
-        ctx->output_camera.focal_point_y = (ctx->output_camera.height - 1) / 2.0;
-    }
+    // Output dimensions default to the input dimensions (disregarding cropping)
+    ctx->ocf.output_width = ctx->output_camera.width
+        ? ctx->output_camera.width : inlink->w;
+    ctx->ocf.output_height = ctx->output_camera.height
+        ? ctx->output_camera.height : inlink->h;
 
     return 0;
 }
@@ -576,19 +620,21 @@ static cl_int copy_frame_to_buffer(
     FrameJob *job
 ) {
     int err;
+    DewobbleOpenCLContext *ctx = avctx->priv;
     AVFrame *frame = job->input_frame;
     cl_mem luma = (cl_mem) frame->data[0];
     cl_mem chroma = (cl_mem) frame->data[1];
     cl_int cle = 0;
-    size_t src_origin[3] = { 0, 0, 0 };
-    size_t luma_region[3] = { frame->width, frame->height, 1 };
-    size_t chroma_region[3] = { frame->width / 2, frame->height / 2, 1 };
+    size_t src_luma_origin[3] = { frame->crop_left, frame->crop_top, 0 };
+    size_t src_chroma_origin[3] = { frame->crop_left / 2, frame->crop_top / 2, 0 };
+    size_t luma_region[3] = { ctx->input_camera.width, ctx->input_camera.height, 1 };
+    size_t chroma_region[3] = { ctx->input_camera.width / 2, ctx->input_camera.height / 2, 1 };
     cl_event copy_finished[2];
 
     job->input_buffer = clCreateBuffer(
         context,
         CL_MEM_READ_ONLY,
-        frame->width * frame->height * 3 / 2,
+        ctx->input_camera.width * ctx->input_camera.height * 3 / 2,
         NULL,
         &cle
     );
@@ -598,7 +644,7 @@ static cl_int copy_frame_to_buffer(
         command_queue,
         luma,
         job->input_buffer,
-        src_origin,
+        src_luma_origin,
         luma_region,
         0,
         0,
@@ -611,9 +657,9 @@ static cl_int copy_frame_to_buffer(
         command_queue,
         chroma,
         job->input_buffer,
-        src_origin,
+        src_chroma_origin,
         chroma_region,
-        frame->width * frame->height * 1,
+        ctx->input_camera.width * ctx->input_camera.height * 1,
         0,
         NULL,
         &copy_finished[1]
@@ -691,19 +737,9 @@ static int consume_input_frame(AVFilterContext *avctx, AVFrame *input_frame) {
         return AVERROR(EINVAL);
     }
 
-    if (input_frame->crop_top || input_frame->crop_bottom ||
-        input_frame->crop_left || input_frame->crop_right
-    ) {
-        av_log(
-            avctx,
-            AV_LOG_WARNING,
-            "Cropping information discarded from input (code not written yet)\n"
-        );
-    }
-
     if (!ctx->initialized) {
         av_log(avctx, AV_LOG_VERBOSE, "Initializing\n");
-        err = dewobble_opencl_frames_init(avctx);
+        err = dewobble_opencl_frames_init(avctx, input_frame);
         if (err < 0) {
             return err;
         }
@@ -778,6 +814,11 @@ static int send_output_frame(AVFilterContext *avctx, FrameJob * job) {
     if (err) {
         goto fail;
     }
+
+    output_frame->crop_top = 0;
+    output_frame->crop_bottom = 0;
+    output_frame->crop_left = 0;
+    output_frame->crop_right = 0;
 
     err = copy_buffer_to_frame(avctx, job->output_buffer, output_frame);
     if (err) {
