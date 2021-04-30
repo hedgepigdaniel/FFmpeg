@@ -766,13 +766,11 @@ static int send_output_frame(AVFilterContext *avctx, FrameJob * job) {
 
     err = av_frame_copy_props(output_frame, job->input_frame);
     if (err) {
-        av_frame_free(&output_frame);
         goto fail;
     }
 
     err = copy_buffer_to_frame(avctx, job->output_buffer, output_frame);
     if (err) {
-        av_frame_free(&output_frame);
         goto fail;
     }
 
@@ -803,6 +801,7 @@ static int send_output_frame(AVFilterContext *avctx, FrameJob * job) {
 
 fail:
     av_log(avctx, AV_LOG_ERROR, "Failed to send output frame: %d\n", err);
+    av_frame_free(&output_frame);
     return err;
 }
 
