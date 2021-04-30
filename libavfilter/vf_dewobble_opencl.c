@@ -39,6 +39,51 @@
 #include "transpose.h"
 #include "video.h"
 
+/**
+ * DESIGN NOTES
+ *
+ * THREADING
+ *
+ * OpenCV has a global/implicit OpenCL context per thread. So to avoid
+ * interfering with other usage of OpenCV, libdewobble is used from a separate
+ * worker thread. Communication between the main thread and the worker thread
+ * is via `DewobbleMessage`s which are sent to the worker on the safe
+ * `dewobble_queue` and back to the main thread on `output_queue`. The worker
+ * thread also calls `ff_filter_set_ready` after sending a message to the main
+ * thread.
+ *
+ * The main thread writes the shared configuration to the filter context before
+ * starting the worker thread, and does not modify it again until after the
+ * worker thread ends. The worker thread reads the configuration but does not
+ * modify it at any time.
+ *
+ * When `DewobbleMessage`s are pushed onto `dewobble_queue` and `output_queue`
+ * their ownership (including all contents) is relinquished to the receiving
+ * thread.
+ *
+ *
+ * QUEUED FRAMES
+ *
+ * libdewobble requires a queue of frames before it can provide output because
+ * it looks ahead to calculate a smooth camera path and/or to interpolate
+ * camera positions from frames where it fails to detect motion. The number of
+ * queued frames required is determined in the filter by `input_frame_wanted`.
+ *
+ *
+ * HARDWARE FRAME ALLOCATION
+ *
+ * Input OpenCL hardware frames contain `cl_image`s but these must be converted
+ * to `cl_buffer`s for libdewobble. Although the filter keeps a reference to the
+ * input frame until the output frame is sent, it unreferences the original
+ * hardware buffers immediately after copying them to a `cl_buffer` in
+ * `consume_input_frame`. This avoids OOM issues for example when using input
+ * frames mapped from VA-API hardware frames where there is a low limit for how
+ * many can be allocated at once. The filter only owns a single input/output
+ * hardware frame buffer at any time, although internally it allocates OpenCL
+ * buffers to store the contents of a queue of frames.
+ *
+ */
+
 // Camera properties
 typedef struct Camera {
 
