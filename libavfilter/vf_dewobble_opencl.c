@@ -234,42 +234,52 @@ static void flush_queues(AVFilterContext *avctx) {
     }
 }
 
-static int pull_ready_frames(
-    AVFilterContext *avctx,
-    DewobbleFilter filter
-) {
+static int pull_ready_frame(AVFilterContext *avctx, DewobbleFilter filter) {
     int err;
     DewobbleOpenCLContext *ctx = avctx->priv;
-    cl_mem output_buffer;
+    cl_mem output_buffer = NULL;
     FrameJob *job = NULL;
     DewobbleMessage *output_message = NULL;
 
-    while (dewobble_filter_frame_ready(filter)) {
-        err = dewobble_filter_pull_frame(filter, &output_buffer, (void **) &job);
-        if (err) {
-            av_log(avctx, AV_LOG_ERROR, "Worker thread: failed to pull frame from dewobbler\n");
-            goto fail;
-        }
-        job->output_buffer = output_buffer;
-
-        output_message = dewobble_message_create(DEWOBBLE_MESSAGE_TYPE_JOB, job);
-        if (output_message == NULL) {
-            goto fail;
-        }
-
-        av_log(avctx, AV_LOG_VERBOSE, "Worker thread: sent frame %ld\n", job->num);
-        err = ff_safe_queue_push_back(ctx->output_queue, output_message);
-        if (err == -1) {
-            goto fail;
-        }
+    err = dewobble_filter_pull_frame(filter, &output_buffer, (void **) &job);
+    if (err) {
+        av_log(avctx, AV_LOG_ERROR, "Worker thread: failed to pull frame from dewobbler\n");
+        goto fail;
     }
-    ff_filter_set_ready(avctx, 1);
+    job->output_buffer = output_buffer;
 
+    output_message = dewobble_message_create(DEWOBBLE_MESSAGE_TYPE_JOB, job);
+    if (output_message == NULL) {
+        goto fail;
+    }
+
+    av_log(avctx, AV_LOG_VERBOSE, "Worker thread: sent frame %ld\n", job->num);
+    err = ff_safe_queue_push_back(ctx->output_queue, output_message);
+    if (err == -1) {
+        goto fail;
+    }
     return 0;
 
 fail:
     clReleaseMemObject(output_buffer);
     dewobble_message_free(&output_message);
+    return err;
+}
+
+static int pull_ready_frames(
+    AVFilterContext *avctx,
+    DewobbleFilter filter
+) {
+    int err = 0;
+
+    while (dewobble_filter_frame_ready(filter)) {
+        err = pull_ready_frame(avctx, filter);
+        if (err) {
+            return err;
+        }
+    }
+    ff_filter_set_ready(avctx, 1);
+
     return err;
 }
 
