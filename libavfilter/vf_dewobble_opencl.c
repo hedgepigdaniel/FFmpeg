@@ -930,7 +930,7 @@ static int try_send_output_frame(AVFilterContext *avctx) {
     if (err) {
         return err;
     }
-    return 0;
+    return 1;
 }
 
 static int try_consume_input_frame(AVFilterContext *avctx) {
@@ -1013,11 +1013,13 @@ static int activate(AVFilterContext *avctx)
 
     check_for_input_eof(avctx);
 
-    err = try_send_output_frame(avctx);
-    if (err) {
-        av_log(avctx, AV_LOG_ERROR, "try_send_output_frame failed: %d\n", err);
-        goto fail;
-    }
+    do {
+        err = try_send_output_frame(avctx);
+        if (err < 0) {
+            av_log(avctx, AV_LOG_ERROR, "try_send_output_frame failed: %d\n", err);
+            goto fail;
+        }
+    } while (err > 0);
 
     return FFERROR_NOT_READY;
 
