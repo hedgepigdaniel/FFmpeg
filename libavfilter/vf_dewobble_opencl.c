@@ -151,6 +151,12 @@ typedef struct DewobbleOpenCLContext {
     // The algorithm to interpolate the value between source image pixels
     int interpolation_algorithm;
 
+    // The algorithm used to fill in unmapped areas of the output
+    int border_type;
+
+    // The color used to fill unmapped areas of the output
+    double border_color[4];
+
     // Whether the filter has been initialized
     int initialized;
 
@@ -379,7 +385,9 @@ static void *dewobble_thread(void *arg) {
         input_camera,
         output_camera,
         stabilizer,
-        ctx->interpolation_algorithm
+        ctx->interpolation_algorithm,
+        ctx->border_type,
+        ctx->border_color
     );
     if (filter == NULL) {
         av_log(avctx, AV_LOG_ERROR, "Worker thread: failed to create libdewobble filter\n");
@@ -1175,6 +1183,47 @@ static const AVOption dewobble_opencl_options[] = {
         FLAGS,
         "interpolation",
     },
+    {
+        "border",
+        "border fill mode",
+        OFFSET(border_type),
+        AV_OPT_TYPE_INT,
+        { .i64 = DEWOBBLE_BORDER_CONSTANT },
+        0,
+        DEWOBBLE_NB_BORDER_TYPES - 1,
+        FLAGS,
+        "border_type",
+    },
+    {
+        "border_r",
+        "border fill color (red component)",
+        OFFSET(border_color) + sizeof(double) * 2,
+        AV_OPT_TYPE_DOUBLE,
+        { .i64 = 0 },
+        0,
+        255,
+        FLAGS,
+    },
+    {
+        "border_g",
+        "border fill color (green component)",
+        OFFSET(border_color) + sizeof(double) * 1,
+        AV_OPT_TYPE_DOUBLE,
+        { .i64 = 0 },
+        0,
+        255,
+        FLAGS,
+    },
+    {
+        "border_b",
+        "border fill color (blue component)",
+        OFFSET(border_color) + sizeof(double) * 0,
+        AV_OPT_TYPE_DOUBLE,
+        { .i64 = 0 },
+        0,
+        255,
+        FLAGS,
+    },
 
     // Camera models
     {
@@ -1281,6 +1330,62 @@ static const AVOption dewobble_opencl_options[] = {
         "interpolation"
     },
 
+    // Border fill algorithms
+    {
+        "constant",
+        "constant color (default black)",
+        0,
+        AV_OPT_TYPE_CONST,
+        { .i64 = DEWOBBLE_BORDER_CONSTANT },
+        INT_MIN,
+        INT_MAX,
+        FLAGS,
+        "border_type"
+    },
+    {
+        "reflect",
+        "reflection of the input about the edge",
+        0,
+        AV_OPT_TYPE_CONST,
+        { .i64 = DEWOBBLE_BORDER_REFLECT},
+        INT_MIN,
+        INT_MAX,
+        FLAGS,
+        "border_type"
+    },
+    {
+        "reflect101",
+        "reflection of the input about the middle of the pixel on the edge",
+        0,
+        AV_OPT_TYPE_CONST,
+        { .i64 = DEWOBBLE_BORDER_REFLECT_101},
+        INT_MIN,
+        INT_MAX,
+        FLAGS,
+        "border_type"
+    },
+    {
+        "replicate",
+        "replicate the pixel on the edge",
+        0,
+        AV_OPT_TYPE_CONST,
+        { .i64 = DEWOBBLE_BORDER_REPLICATE},
+        INT_MIN,
+        INT_MAX,
+        FLAGS,
+        "border_type"
+    },
+    {
+        "wrap",
+        "wrap around to the opposite side of the source image",
+        0,
+        AV_OPT_TYPE_CONST,
+        { .i64 = DEWOBBLE_BORDER_WRAP},
+        INT_MIN,
+        INT_MAX,
+        FLAGS,
+        "border_type"
+    },
     { NULL }
 };
 
