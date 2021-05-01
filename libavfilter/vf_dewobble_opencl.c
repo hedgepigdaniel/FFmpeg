@@ -404,8 +404,8 @@ static void *dewobble_thread(void *arg) {
                 av_log(avctx, AV_LOG_VERBOSE, "Worker thread: transforming frame %ld\n", job->num);
                 err = dewobble_filter_push_frame(filter, job->input_buffer, job);
                 if (err) {
-                    frame_job_free(avctx, &job);
                     av_log(avctx, AV_LOG_ERROR, "Worker thread: failed to push %ld\n", job->num);
+                    frame_job_free(avctx, &job);
                     break;
                 }
                 job = NULL;
