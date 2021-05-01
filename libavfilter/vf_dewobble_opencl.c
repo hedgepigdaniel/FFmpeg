@@ -959,11 +959,11 @@ static int try_consume_input_frame(AVFilterContext *avctx) {
                 av_log(avctx, AV_LOG_ERROR, "Failed to consume input frame: %d\n", err);
                 return err;
             }
+        }
 
-            // Request more frames if necessary
-            if (input_frame_wanted(ctx)) {
-                ff_inlink_request_frame(inlink);
-            }
+        // Request more frames if necessary
+        if (input_frame_wanted(ctx)) {
+            ff_inlink_request_frame(inlink);
         }
     }
     return err;
