@@ -220,6 +220,11 @@ typedef struct DewobbleMessage {
     FrameJob *job;
 } DewobbleMessage;
 
+/**
+ * Besides the bare minimum of 1, additional frames are send to the dewobble
+ * thread before any are pulled from the output queue to avoid unecessary
+ * blocking.
+ */
 #define EXTRA_IN_PROGRESS_FRAMES 1
 
 static DewobbleMessage *dewobble_message_create(DewobbleMessageType type, FrameJob *job) {
