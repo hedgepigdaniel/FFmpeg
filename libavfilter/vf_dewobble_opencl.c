@@ -256,8 +256,14 @@ static void frame_job_free(AVFilterContext *avctx, FrameJob **frame) {
     cl_int cle;
     if (*frame != NULL) {
         av_frame_free(&(*frame)->input_frame);
-        CL_RELEASE_MEMORY((*frame)->input_buffer);
-        CL_RELEASE_MEMORY((*frame)->output_buffer);
+        if ((*frame)->input_buffer != NULL) {
+            CL_RELEASE_MEMORY((*frame)->input_buffer);
+            (*frame)->input_buffer = NULL;
+        }
+        if ((*frame)->output_buffer != NULL) {
+            CL_RELEASE_MEMORY((*frame)->output_buffer);
+            (*frame)->output_buffer = NULL;
+        }
     }
     av_freep(frame);
 }
@@ -342,6 +348,7 @@ static void *dewobble_thread(void *arg) {
     DewobbleStabilizer stabilizer = NULL;
     int input_eof = 0;
     int err = 0;
+    cl_int cle;
 
     dewobble_init_opencl_context(ctx->ocf.hwctx->context, ctx->ocf.hwctx->device_id);
 
@@ -406,6 +413,8 @@ static void *dewobble_thread(void *arg) {
                     frame_job_free(avctx, &job);
                     break;
                 }
+                CL_RELEASE_MEMORY(job->input_buffer);
+                job->input_buffer = NULL;
                 job = NULL;
                 err = pull_ready_frames(avctx, filter);
                 if (err) {
