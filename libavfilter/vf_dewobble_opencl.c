@@ -1040,6 +1040,9 @@ static int activate(AVFilterContext *avctx)
     if (ff_inlink_check_available_frame(inlink)) {
         // Immediately, if input frames are still queued
         ff_filter_set_ready(avctx, 1);
+    } else if (ctx->input_status && ctx->nb_frames_in_progress > 0) {
+        // Immediately, if the input has ended
+        ff_filter_set_ready(avctx, 1);
     } else if (input_frame_wanted(ctx)) {
         // Otherwise when more input frames are ready
         ff_inlink_request_frame(inlink);
