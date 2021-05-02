@@ -304,11 +304,12 @@ static int pull_ready_frame(AVFilterContext *avctx, DewobbleFilter filter) {
         goto fail;
     }
 
-    av_log(avctx, AV_LOG_VERBOSE, "Worker thread: sent frame %ld\n", job->num);
     err = ff_safe_queue_push_back(ctx->output_queue, output_message);
     if (err == -1) {
+        av_log(avctx, AV_LOG_ERROR, "Worker thread: failed to send frame %ld\n", job->num);
         goto fail;
     }
+    av_log(avctx, AV_LOG_VERBOSE, "Worker thread: sent frame %ld\n", job->num);
     return 0;
 
 fail:
@@ -322,14 +323,18 @@ static int pull_ready_frames(
     DewobbleFilter filter
 ) {
     int err = 0;
+    int pulled_frames = 0;
 
     while (dewobble_filter_frame_ready(filter)) {
         err = pull_ready_frame(avctx, filter);
         if (err) {
             return err;
         }
+        pulled_frames = 1;
     }
-    ff_filter_set_ready(avctx, 1);
+    if (pulled_frames) {
+        ff_filter_set_ready(avctx, 1);
+    }
 
     return err;
 }
@@ -481,6 +486,8 @@ static void stop_dewobble_thread_on_error(AVFilterContext *avctx) {
     DewobbleMessage *message = NULL;
     int err;
 
+    av_log(avctx, AV_LOG_VERBOSE, "Stopping dewobble thread\n");
+
     if (ctx->dewobble_thread_ending == 1) {
         return;
     }
@@ -506,6 +513,7 @@ fail:
 
 static int dewobble_opencl_init(AVFilterContext *avctx) {
     DewobbleOpenCLContext *ctx = avctx->priv;
+    av_log(avctx, AV_LOG_VERBOSE, "Init\n");
     if (ctx->input_camera.model == DEWOBBLE_NB_PROJECTIONS
         || ctx->output_camera.model == DEWOBBLE_NB_PROJECTIONS
     ) {
@@ -959,12 +967,17 @@ static int try_consume_input_frame(AVFilterContext *avctx) {
                 av_log(avctx, AV_LOG_ERROR, "Failed to consume input frame: %d\n", err);
                 return err;
             }
+        } else {
+            av_log(avctx, AV_LOG_VERBOSE, "No input frame available\n");
         }
 
         // Request more frames if necessary
         if (input_frame_wanted(ctx)) {
+            av_log(avctx, AV_LOG_VERBOSE, "Requesting input frame\n");
             ff_inlink_request_frame(inlink);
         }
+    } else {
+        av_log(avctx, AV_LOG_VERBOSE, "Input frame not wanted\n");
     }
     return err;
 }
@@ -983,6 +996,7 @@ static void check_for_input_eof(AVFilterContext *avctx) {
             ctx->input_eof = 1;
             send_eof_to_dewobble_thread(avctx);
             if (ctx->nb_frames_in_progress == 0) {
+                av_log(avctx, AV_LOG_VERBOSE, "Sending output EOF\n");
                 ff_outlink_set_status(outlink, AVERROR_EOF, pts);
             }
         } else if (status) {
@@ -993,9 +1007,12 @@ static void check_for_input_eof(AVFilterContext *avctx) {
 
 static int activate(AVFilterContext *avctx)
 {
+    DewobbleOpenCLContext *ctx = avctx->priv;
     AVFilterLink *inlink = avctx->inputs[0];
     AVFilterLink *outlink = avctx->outputs[0];
     int err = 0;
+
+    av_log(avctx, AV_LOG_VERBOSE, "Activate\n");
 
     err = ff_outlink_get_status(outlink);
     if (err) {
