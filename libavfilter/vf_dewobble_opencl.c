@@ -48,9 +48,9 @@
  * interfering with other usage of OpenCV, libdewobble is used from a separate
  * worker thread. Communication between the main thread and the worker thread
  * is via `DewobbleMessage`s which are sent to the worker on the safe
- * `dewobble_queue` and back to the main thread on `output_queue`. The worker
- * thread also calls `ff_filter_set_ready` after sending a message to the main
- * thread.
+ * `dewobble_queue` and back to the main thread on `output_queue`. The main
+ * thread does not attempt to pull from `output_queue` until there are enough
+ * frames in progress that the worker thread will output at least one frame.
  *
  * The main thread writes the shared configuration to the filter context before
  * starting the worker thread, and does not modify it again until after the
@@ -160,8 +160,11 @@ typedef struct DewobbleOpenCLContext {
     // Whether the filter has been initialized
     int initialized;
 
-    // Whether the end of the input link has been reached
-    int input_eof;
+    // The status of the input link
+    int input_status;
+
+    // The time that the input status was reached
+    int64_t input_status_pts;
 
     // Number of frame jobs currently in progress (read from inlink but
     // not yet sent to outlink)
@@ -195,9 +198,6 @@ typedef struct FrameJob {
     // The AVFilterContext for the filter
     AVFilterContext *avctx;
 
-    // Frame presentation timestamp
-    int64_t pts;
-
     // Input frame
     AVFrame *input_frame;
 
@@ -220,7 +220,7 @@ typedef struct DewobbleMessage {
     FrameJob *job;
 } DewobbleMessage;
 
-#define EXTRA_IN_PROGRESS_FRAMES 2
+#define EXTRA_IN_PROGRESS_FRAMES 1
 
 static DewobbleMessage *dewobble_message_create(DewobbleMessageType type, FrameJob *job) {
     DewobbleMessage *result = av_mallocz(sizeof(DewobbleMessage));
@@ -241,7 +241,6 @@ static void dewobble_message_free(DewobbleMessage **message) {
 
 static FrameJob *frame_job_create(
     AVFilterContext *avctx,
-    int64_t pts,
     AVFrame *input_frame
 ) {
     FrameJob *result = av_mallocz(sizeof(FrameJob));
@@ -249,7 +248,6 @@ static FrameJob *frame_job_create(
         return NULL;
     }
     result->avctx = avctx;
-    result->pts = pts;
     result->input_frame = input_frame;
     return result;
 }
@@ -323,17 +321,12 @@ static int pull_ready_frames(
     DewobbleFilter filter
 ) {
     int err = 0;
-    int pulled_frames = 0;
 
     while (dewobble_filter_frame_ready(filter)) {
         err = pull_ready_frame(avctx, filter);
         if (err) {
             return err;
         }
-        pulled_frames = 1;
-    }
-    if (pulled_frames) {
-        ff_filter_set_ready(avctx, 1);
     }
 
     return err;
@@ -443,7 +436,6 @@ static void *dewobble_thread(void *arg) {
         output_message = dewobble_message_create(DEWOBBLE_MESSAGE_TYPE_ERROR, NULL);
         if (output_message != NULL) {
             ff_safe_queue_push_back(ctx->output_queue, output_message);
-            ff_filter_set_ready(avctx, 1);
         }
     }
 
@@ -808,7 +800,6 @@ static int consume_input_frame(AVFilterContext *avctx, AVFrame *input_frame) {
 
     job = frame_job_create(
         avctx,
-        input_frame->pts,
         input_frame
     );
     job->num = ctx->nb_frames_consumed;
@@ -854,7 +845,7 @@ static int input_frame_wanted(DewobbleOpenCLContext *ctx) {
         ? ctx->stabilization_radius
         : 0;
     nb_buffered_frames += ctx->stabilization_horizon;
-    return !ctx->input_eof && ctx->nb_frames_in_progress < nb_buffered_frames
+    return !ctx->input_status && ctx->nb_frames_in_progress < nb_buffered_frames
         + 1 + EXTRA_IN_PROGRESS_FRAMES;
 }
 
@@ -904,10 +895,10 @@ static int send_output_frame(AVFilterContext *avctx, FrameJob * job) {
         ff_inlink_request_frame(inlink);
     }
 
-    if (ctx->input_eof && ctx->nb_frames_in_progress == 0) {
+    if (ctx->input_status && ctx->nb_frames_in_progress == 0) {
         av_log(avctx, AV_LOG_VERBOSE, "Output reached EOF\n");
         send_eof_to_dewobble_thread(avctx);
-        ff_outlink_set_status(outlink, AVERROR_EOF, job->pts);
+        ff_outlink_set_status(outlink, ctx->input_status, ctx->input_status_pts);
     }
     return 0;
 
@@ -920,7 +911,9 @@ fail:
 static int try_send_output_frame(AVFilterContext *avctx) {
     int err;
     DewobbleOpenCLContext *ctx = avctx->priv;
-    DewobbleMessage *message = (DewobbleMessage *) ff_safe_queue_pop_front(ctx->output_queue);
+    DewobbleMessage *message = (DewobbleMessage *) ff_safe_queue_pop_front_blocking(
+        ctx->output_queue
+    );
 
     if (message == NULL) {
         return 0;
@@ -967,40 +960,28 @@ static int try_consume_input_frame(AVFilterContext *avctx) {
                 av_log(avctx, AV_LOG_ERROR, "Failed to consume input frame: %d\n", err);
                 return err;
             }
-        } else {
-            av_log(avctx, AV_LOG_VERBOSE, "No input frame available\n");
         }
-
-        // Request more frames if necessary
-        if (input_frame_wanted(ctx)) {
-            av_log(avctx, AV_LOG_VERBOSE, "Requesting input frame\n");
-            ff_inlink_request_frame(inlink);
-        }
-    } else {
-        av_log(avctx, AV_LOG_VERBOSE, "Input frame not wanted\n");
     }
     return err;
 }
 
-static void check_for_input_eof(AVFilterContext *avctx) {
+static void check_input_status(AVFilterContext *avctx) {
     AVFilterLink *inlink = avctx->inputs[0];
     AVFilterLink *outlink = avctx->outputs[0];
     DewobbleOpenCLContext *ctx = avctx->priv;
-    int64_t pts;
-    int status;
 
     // Check for end of input
-    if (!ctx->input_eof && ff_inlink_acknowledge_status(inlink, &status, &pts)) {
-        if (status == AVERROR_EOF) {
+    if (!ctx->input_status && ff_inlink_acknowledge_status(inlink, &ctx->input_status, &ctx->input_status_pts)) {
+        if (ctx->input_status == AVERROR_EOF) {
             av_log(avctx, AV_LOG_VERBOSE, "Reached input EOF\n");
-            ctx->input_eof = 1;
-            send_eof_to_dewobble_thread(avctx);
-            if (ctx->nb_frames_in_progress == 0) {
-                av_log(avctx, AV_LOG_VERBOSE, "Sending output EOF\n");
-                ff_outlink_set_status(outlink, AVERROR_EOF, pts);
-            }
-        } else if (status) {
-            av_log(avctx, AV_LOG_ERROR, "INPUT STATUS: %d\n", status);
+        } else {
+            av_log(avctx, AV_LOG_ERROR, "Input status: %d\n", ctx->input_status);
+        }
+
+        send_eof_to_dewobble_thread(avctx);
+        if (ctx->nb_frames_in_progress == 0) {
+            av_log(avctx, AV_LOG_VERBOSE, "Sending output EOF\n");
+            ff_outlink_set_status(outlink, ctx->input_status, ctx->input_status_pts);
         }
     }
 }
@@ -1012,8 +993,7 @@ static int activate(AVFilterContext *avctx)
     AVFilterLink *outlink = avctx->outputs[0];
     int err = 0;
 
-    av_log(avctx, AV_LOG_VERBOSE, "Activate\n");
-
+    // Forward any output status to input
     err = ff_outlink_get_status(outlink);
     if (err) {
         av_log(avctx, AV_LOG_VERBOSE, "forwarding status to inlink: %d\n", err);
@@ -1022,21 +1002,34 @@ static int activate(AVFilterContext *avctx)
         return 0;
     }
 
+    // Consume an input frame if possible
     err = try_consume_input_frame(avctx);
     if (err) {
         av_log(avctx, AV_LOG_ERROR, "try_consume_input_frame failed: %d\n", err);
-        goto fail;
+        stop_dewobble_thread_on_error(avctx);
+        return 0;
     }
 
-    check_for_input_eof(avctx);
+    // Check input status, including detecting EOF
+    check_input_status(avctx);
 
-    do {
+    // If there are enough frames in progress, try to send an output frame
+    if (!input_frame_wanted(ctx) && ctx->nb_frames_in_progress > 0) {
         err = try_send_output_frame(avctx);
         if (err < 0) {
             av_log(avctx, AV_LOG_ERROR, "try_send_output_frame failed: %d\n", err);
             goto fail;
         }
-    } while (err > 0);
+    }
+
+    // Schedule the next activation
+    if (ff_inlink_check_available_frame(inlink)) {
+        // Immediately, if input frames are still queued
+        ff_filter_set_ready(avctx, 1);
+    } else if (input_frame_wanted(ctx)) {
+        // Otherwise when more input frames are ready
+        ff_inlink_request_frame(inlink);
+    }
 
     return FFERROR_NOT_READY;
 
