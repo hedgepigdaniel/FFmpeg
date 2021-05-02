@@ -226,7 +226,7 @@ extern const AVFilter ff_vf_deshake;
 extern const AVFilter ff_vf_deshake_opencl;
 extern const AVFilter ff_vf_despill;
 extern const AVFilter ff_vf_detelecine;
-extern AVFilter ff_vf_dewobble_opencl;
+extern const AVFilter ff_vf_dewobble_opencl;
 extern const AVFilter ff_vf_dilation;
 extern const AVFilter ff_vf_dilation_opencl;
 extern const AVFilter ff_vf_displace;

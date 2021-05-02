@@ -1428,7 +1428,7 @@ static const AVFilterPad dewobble_opencl_outputs[] = {
     { NULL }
 };
 
-AVFilter ff_vf_dewobble_opencl = {
+const AVFilter ff_vf_dewobble_opencl = {
     .name           = "dewobble_opencl",
     .description    = NULL_IF_CONFIG_SMALL(
         "apply motion stabilization with awareness of camera projection and/or change camera projection"
